@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FPM10A • Finger Console</title>
+<style>
+  :root{
+    --bg:#0b1120; --panel:#111a2e; --panel2:#0d1626; --border:#1e2d47;
+    --txt:#e6edf7; --muted:#7d8aa3; --accent:#3b82f6; --accent2:#60a5fa;
+    --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; --info:#38bdf8;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;font-family:'Segoe UI',Inter,system-ui,sans-serif;background:var(--bg);color:var(--txt);display:flex}
+  a{color:var(--accent2);text-decoration:none}
+
+  /* sidebar */
+  .sidebar{width:236px;flex-shrink:0;background:linear-gradient(180deg,#0e1729,#0a1120);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:18px 12px}
+  .brand{display:flex;align-items:center;gap:10px;padding:6px 8px 18px;border-bottom:1px solid var(--border);margin-bottom:10px}
+  .brand .logo{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;font-size:18px}
+  .brand .t{font-weight:700;font-size:15px;line-height:1.1}
+  .brand .s{font-size:11px;color:var(--muted)}
+  nav{display:flex;flex-direction:column;gap:3px;flex:1}
+  .nav-item{display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:8px;color:var(--muted);cursor:pointer;font-size:14px;font-weight:500;transition:.15s;border:1px solid transparent}
+  .nav-item:hover{background:rgba(59,130,246,.08);color:var(--txt)}
+  .nav-item.active{background:rgba(59,130,246,.14);color:var(--accent2);border-color:rgba(59,130,246,.25)}
+  .nav-item svg{width:18px;height:18px;flex-shrink:0}
+  .side-foot{font-size:11px;color:var(--muted);padding:10px 8px;border-top:1px solid var(--border)}
+  .side-foot .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:middle;background:#64748b}
+  .side-foot .dot.ok{background:var(--ok);box-shadow:0 0 0 3px rgba(34,197,94,.18);animation:pulse 2s infinite}
+  .side-foot .dot.bad{background:var(--err)}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(34,197,94,.4)}70%{box-shadow:0 0 0 6px rgba(34,197,94,0)}100%{box-shadow:0 0 0 0 rgba(34,197,94,0)}}
+
+  /* main */
+  .main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+  .topbar{height:58px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 22px;background:rgba(13,22,38,.6)}
+  .topbar h1{margin:0;font-size:16px;font-weight:600}
+  .topbar .sub{font-size:12px;color:var(--muted);margin-top:2px}
+  .topbar .right{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted)}
+  .pill{background:var(--panel);border:1px solid var(--border);padding:5px 11px;border-radius:20px;font-size:12px;color:var(--muted)}
+  .pill b{color:var(--txt)}
+  .content{flex:1;overflow-y:auto;padding:22px}
+  .section{display:none;max-width:1100px;margin:0 auto}
+  .section.active{display:block;animation:fade .25s}
+  @keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+  .grid{display:grid;gap:16px}
+  .g-2{grid-template-columns:repeat(2,1fr)}
+  .g-3{grid-template-columns:repeat(3,1fr)}
+  .g-4{grid-template-columns:repeat(4,1fr)}
+  @media(max-width:860px){.g-2,.g-3,.g-4{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px}
+  .card h2{margin:0 0 14px;font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:600;display:flex;align-items:center;gap:8px}
+  .card h2 .ic{width:16px;height:16px;color:var(--accent2)}
+
+  .stat{display:flex;align-items:center;gap:14px}
+  .stat .ico{width:44px;height:44px;border-radius:11px;background:rgba(59,130,246,.12);display:flex;align-items:center;justify-content:center;color:var(--accent2)}
+  .stat .ico svg{width:22px;height:22px}
+  .stat .v{font-size:26px;font-weight:700;line-height:1}
+  .stat .l{font-size:12px;color:var(--muted);margin-top:3px}
+
+  /* forms */
+  input[type=text]{width:100%;padding:11px 13px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;color:var(--txt);font-size:14px}
+  input[type=text]:focus{outline:none;border-color:var(--accent)}
+  .btn{padding:10px 16px;border:1px solid transparent;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:.15s;display:inline-flex;align-items:center;gap:7px}
+  .btn svg{width:16px;height:16px}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .btn-pri{background:var(--accent);color:#fff}
+  .btn-pri:hover:not(:disabled){background:#2563eb}
+  .btn-ok{background:var(--ok);color:#04210f}
+  .btn-ok:hover:not(:disabled){background:#16a34a;color:#fff}
+  .btn-sec{background:var(--panel2);color:var(--txt);border-color:var(--border)}
+  .btn-sec:hover:not(:disabled){border-color:var(--accent)}
+  .btn-dng{background:rgba(239,68,68,.12);color:#fca5a5;border-color:rgba(239,68,68,.3)}
+  .btn-dng:hover:not(:disabled){background:var(--err);color:#fff}
+  .row{display:flex;gap:8px;align-items:center}
+  .row .grow{flex:1}
+
+  /* stepper */
+  .steps{display:flex;gap:6px;margin:6px 0 14px}
+  .step{flex:1;height:6px;border-radius:3px;background:var(--border);transition:.3s}
+  .step.done{background:var(--ok)}
+  .step.active{background:var(--accent2);box-shadow:0 0 8px rgba(96,165,250,.6)}
+  .step-labels{display:flex;justify-content:space-between;font-size:10px;color:var(--muted);margin-bottom:10px}
+
+  /* log */
+  .log{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:11px;height:240px;overflow-y:auto;font-family:ui-monospace,Consolas,monospace;font-size:12.5px;line-height:1.55}
+  .log .ln{white-space:pre-wrap;word-break:break-word}
+  .log .ln .ts{color:#475569;margin-right:6px}
+  .ok{color:#4ade80}.err{color:#f87171}.info{color:#7dd3fc}.warn{color:#fbbf24}.muted{color:#64748b}
+
+  /* scan result */
+  .scan-box{border-radius:14px;padding:26px;text-align:center;border:1px solid var(--border);background:radial-gradient(circle at 50% 0%,rgba(59,130,246,.10),transparent 70%);margin-bottom:14px;min-height:150px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px}
+  .scan-box.match{border-color:rgba(34,197,94,.5);background:radial-gradient(circle at 50% 0%,rgba(34,197,94,.16),transparent 70%)}
+  .scan-box.nomatch{border-color:rgba(239,68,68,.5);background:radial-gradient(circle at 50% 0%,rgba(239,68,68,.16),transparent 70%)}
+  .scan-ico{width:54px;height:54px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin-bottom:6px;background:var(--panel2)}
+  .scan-ico svg{width:28px;height:28px}
+  .scan-name{font-size:22px;font-weight:700}
+  .scan-sub{font-size:13px;color:var(--muted)}
+  .conf-wrap{width:60%;max-width:280px;margin-top:10px}
+  .conf-bar{height:8px;border-radius:4px;background:var(--border);overflow:hidden}
+  .conf-fill{height:100%;background:linear-gradient(90deg,#22c55e,#84cc16);transition:width .4s}
+  .conf-txt{font-size:11px;color:var(--muted);margin-top:4px}
+
+  /* table */
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--border)}
+  th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+  td.id{color:var(--accent2);font-weight:600;width:70px}
+  td.act{width:90px;text-align:right}
+  .empty{color:var(--muted);font-style:italic;text-align:center;padding:18px}
+  .search{margin-bottom:12px}
+
+  /* info rows */
+  .info-row{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--border);font-size:13px}
+  .info-row:last-child{border-bottom:none}
+  .info-row .k{color:var(--muted)}
+  .info-row .v{font-weight:600;font-family:ui-monospace,monospace}
+
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-top:8px}
+  .legend span{display:inline-flex;align-items:center;gap:5px}
+  .legend i{width:9px;height:9px;border-radius:2px;display:inline-block}
+  .hint{font-size:12px;color:var(--muted);margin-top:8px}
+  .badge{display:inline-block;padding:2px 9px;border-radius:12px;background:rgba(59,130,246,.15);color:var(--accent2);font-size:11px;font-weight:600}
+</style>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="brand">
+    <div class="logo">🔐</div>
+    <div><div class="t">FPM10A</div><div class="s">Finger Console</div></div>
+  </div>
+  <nav>
+    <div class="nav-item active" data-sec="dash">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
+      Dashboard
+    </div>
+    <div class="nav-item" data-sec="enroll">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+      Daftar Sidik Jari
+    </div>
+    <div class="nav-item" data-sec="scan">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      Scan & Cocokkan
+    </div>
+    <div class="nav-item" data-sec="data">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      Data Terdaftar
+    </div>
+    <div class="nav-item" data-sec="info">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+      Info Sensor
+    </div>
+  </nav>
+  <div class="side-foot"><span id="dot" class="dot"></span><span id="sideStatus">menghubungkan...</span></div>
+</aside>
+
+<div class="main">
+  <div class="topbar">
+    <div>
+      <h1 id="title">Dashboard</h1>
+      <div class="sub" id="subtitle">Ringkasan status & aktivitas</div>
+    </div>
+    <div class="right">
+      <span class="pill">baud <b id="tBaud">-</b></span>
+      <span class="pill">security <b id="tSec">-</b></span>
+      <span class="pill">terdaftar <b id="tCount">-</b></span>
+    </div>
+  </div>
+
+  <div class="content">
+
+  <!-- DASHBOARD -->
+  <div class="section active" id="sec-dash">
+    <div class="grid g-4">
+      <div class="card"><div class="stat"><div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></div><div><div class="v" id="dStat">-</div><div class="l">Status Sensor</div></div></div></div>
+      <div class="card"><div class="stat"><div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></div><div><div class="v" id="dCount">-</div><div class="l">Sidik Jari Terdaftar</div></div></div></div>
+      <div class="card"><div class="stat"><div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div><div><div class="v" id="dScan">-</div><div class="l">Mode Scan</div></div></div></div>
+      <div class="card"><div class="stat"><div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div><div><div class="v" id="dUptime">-</div><div class="l">Uptime Bridge</div></div></div></div>
+    </div>
+    <div class="grid g-2" style="margin-top:16px">
+      <div class="card">
+        <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l4-4 4 3 5-6"/></svg> Aktivitas Terkini</h2>
+        <div class="log" id="dashLog"><div class="ln muted">belum ada aktivitas</div></div>
+      </div>
+      <div class="card">
+        <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Aksi Cepat</h2>
+        <div class="row" style="margin-bottom:8px"><button class="btn btn-pri grow" onclick="go('enroll')">+ Daftar Sidik Jari</button></div>
+        <div class="row"><button class="btn btn-sec grow" onclick="go('scan')">Mulai Scan</button><button class="btn btn-sec" onclick="go('data')">Lihat Data</button></div>
+        <div class="hint">Tip: enrol butuh 2× penempelan jari yang sama. Scan berlangsung real-time.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ENROLL -->
+  <div class="section" id="sec-enroll">
+    <div class="card">
+      <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg> Pendaftaran Sidik Jari</h2>
+      <div class="row" style="margin-bottom:14px">
+        <input type="text" id="nameInput" class="grow" placeholder="Nama pemilik (mis. liz)" autocomplete="off">
+        <button class="btn btn-ok" id="enrollBtn">Mulai Daftar</button>
+      </div>
+      <div class="step-labels"><span>Bersih</span><span>Jari 1</span><span>Proses 1</span><span>Angkat</span><span>Jari 2</span><span>Proses 2</span><span>Model</span><span>Simpan</span></div>
+      <div class="steps" id="steps">
+        <div class="step" data-s="0"></div><div class="step" data-s="1"></div><div class="step" data-s="2"></div><div class="step" data-s="3"></div>
+        <div class="step" data-s="4"></div><div class="step" data-s="5"></div><div class="step" data-s="6"></div><div class="step" data-s="7"></div>
+      </div>
+      <div class="log" id="enrollLog"></div>
+      <div class="hint">Ikuti petunjuk di log. Sensor minta jari diletakkan 2× dengan jari yang sama.</div>
+    </div>
+  </div>
+
+  <!-- SCAN -->
+  <div class="section" id="sec-scan">
+    <div class="card">
+      <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Pencocokan Sidik Jari</h2>
+      <div class="scan-box" id="scanBox">
+        <div class="scan-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 11c0-3-2-5-2-5"/><path d="M12 11c0-1.5-1-3-1-3"/><path d="M12 11c0-3 2-5 2-5"/><path d="M8 14c0 2 2 4 4 4s4-2 4-4-2-6-4-6-4 4-4 6z"/></svg></div>
+        <div class="scan-name" id="scanName">Idle</div>
+        <div class="scan-sub" id="scanSub">Tekan "Mulai Scan" lalu letakkan jari</div>
+        <div class="conf-wrap" id="confWrap" style="display:none"><div class="conf-bar"><div class="conf-fill" id="confFill"></div></div><div class="conf-txt" id="confTxt"></div></div>
+      </div>
+      <div class="row" style="margin-bottom:12px">
+        <button class="btn btn-pri" id="scanOnBtn">Mulai Scan</button>
+        <button class="btn btn-sec" id="scanOffBtn" disabled>Stop</button>
+      </div>
+      <div class="log" id="scanLog"></div>
+    </div>
+  </div>
+
+  <!-- DATA -->
+  <div class="section" id="sec-data">
+    <div class="card">
+      <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg> Daftar Sidik Jari Terdaftar <span class="badge" id="dataCount">0</span></h2>
+      <div class="row search"><input type="text" id="searchInput" placeholder="Cari nama..." class="grow"><button class="btn btn-sec" id="refreshBtn">Muat Ulang</button></div>
+      <table>
+        <thead><tr><th>ID</th><th>Nama</th><th style="text-align:right">Aksi</th></tr></thead>
+        <tbody id="tblBody"><tr><td colspan="3" class="empty">memuat...</td></tr></tbody>
+      </table>
+      <div class="row" style="margin-top:14px"><button class="btn btn-dng" id="emptyBtn">Hapus Semua Data</button></div>
+    </div>
+  </div>
+
+  <!-- INFO -->
+  <div class="section" id="sec-info">
+    <div class="grid g-2">
+      <div class="card">
+        <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/><line x1="6" y1="12" x2="6" y2="12"/></svg> Parameter Sensor</h2>
+        <div id="infoRows"><div class="info-row"><span class="k">Status</span><span class="v" id="iStat">-</span></div><div class="info-row"><span class="k">Baud Rate</span><span class="v" id="iBaud">-</span></div><div class="info-row"><span class="k">Security Level</span><span class="v" id="iSec">-</span></div><div class="info-row"><span class="k">UART Backend</span><span class="v" id="iUart">-</span></div><div class="info-row"><span class="k">Kapasitas</span><span class="v" id="iCap">300</span></div><div class="info-row"><span class="k">Template Count</span><span class="v" id="iCount">-</span></div></div>
+      </div>
+      <div class="card">
+        <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/></svg> Tentang Security Level</h2>
+        <div class="info-row"><span class="k">Level 1</span><span class="v">Sangat longgar</span></div>
+        <div class="info-row"><span class="k">Level 2</span><span class="v">Longgar</span></div>
+        <div class="info-row"><span class="k">Level 3 (aktif)</span><span class="v">Seimbang</span></div>
+        <div class="info-row"><span class="k">Level 4</span><span class="v">Ketat</span></div>
+        <div class="info-row"><span class="k">Level 5</span><span class="v">Sangat ketat</span></div>
+        <div class="hint">Level lebih tinggi = lebih akurat tapi rentan false-reject. FPM10A akurasi realistis ~90-95%.</div>
+      </div>
+    </div>
+  </div>
+
+  </div>
+</div>
+
+<script>
+const $=(id)=>document.getElementById(id);
+const TITLES={dash:['Dashboard','Ringkasan status & aktivitas'],enroll:['Daftar Sidik Jari','Pendaftaran 2-langkah'],scan:['Scan & Cocokkan','Pencocokan real-time'],data:['Data Terdaftar','Kelola sidik jari tersimpan'],info:['Info Sensor','Parameter & dokumentasi']};
+function go(sec){
+  document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));
+  $('sec-'+sec).classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.sec===sec));
+  $('title').textContent=TITLES[sec][0];$('subtitle').textContent=TITLES[sec][1];
+}
+document.querySelectorAll('.nav-item').forEach(n=>n.addEventListener('click',()=>go(n.dataset.sec)));
+
+function tsNow(){const d=new Date();return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0')+':'+d.getSeconds().toString().padStart(2,'0');}
+function log(el,cls,txt){const d=document.createElement('div');d.className='ln '+cls;d.innerHTML='<span class="ts">'+tsNow()+'</span>'+txt;el.appendChild(d);el.scrollTop=el.scrollHeight;}
+function clearLog(el){el.innerHTML='';}
+
+let autoActive=false, readyAt=0, readyData=null;
+
+const _EL=window.electron;
+async function api(path,method='GET',body=null){
+  if(_EL){
+    switch(path){
+      case '/api/list': return _EL.api.list();
+      case '/api/count': return _EL.api.count();
+      case '/api/status': return _EL.api.status();
+      case '/api/enroll': return _EL.api.enroll(body);
+      case '/api/autoscan/on': return _EL.api.autoscanOn();
+      case '/api/autoscan/off': return _EL.api.autoscanOff();
+      case '/api/delete': return _EL.api.delete(body);
+      case '/api/empty': return _EL.api.empty();
+      default: return {ok:false,error:'not_found'};
+    }
+  }
+  const opt={method,headers:{}};if(body){opt.headers['Content-Type']='application/json';opt.body=JSON.stringify(body);}const r=await fetch(path,opt);return r.json().catch(()=>({ok:false,error:'bad_response'}));
+}
+
+// Events: Electron IPC atau SSE
+if(_EL){_EL.onEvent((o)=>{try{handle(o);}catch{}});}
+else{const evt=new EventSource('/api/events');evt.addEventListener('message',(e)=>{try{handle(JSON.parse(e.data));}catch{}});}
+
+function setSteps(n){
+  document.querySelectorAll('#steps .step').forEach((s,i)=>{s.classList.remove('active','done');if(i<n)s.classList.add('done');else if(i===n)s.classList.add('active');});
+}
+
+function handle(o){
+  if(o.type==='ready'){
+    readyData=o.info||{};readyAt=Date.now();
+    const i=readyData;
+    $('dot').className='dot ok';$('sideStatus').textContent='sensor siap';
+    $('dStat').textContent='SIAP';$('dStat').style.color='var(--ok)';
+    $('tBaud').textContent=i.baud;$('tSec').textContent=i.security;
+    $('iStat').textContent='SIAP';$('iBaud').textContent=i.baud;$('iSec').textContent=i.security;$('iUart').textContent=i.uart||'-';
+    log($('dashLog'),'info','Bridge siap • baud '+i.baud+' • security '+i.security);
+  }else if(o.type==='enroll_start'){
+    go('enroll');
+    log($('enrollLog'),'info','Mulai daftar ID '+o.id+' ('+o.name+'). Letakkan jari...');
+    log($('dashLog'),'info','Enrol dimulai: '+o.name+' (ID '+o.id+')');
+    $('enrollBtn').disabled=true;setSteps(0);
+  }else if(o.type==='enroll_done'){
+    setSteps(8);document.querySelectorAll('#steps .step').forEach(s=>{s.classList.remove('active');s.classList.add('done');});
+    log($('enrollLog'),'ok','✓ Sukses! "'+o.name+'" tersimpan (ID '+o.id+').');
+    log($('dashLog'),'ok','✓ Enrol selesai: '+o.name+' (ID '+o.id+')');
+    $('enrollBtn').disabled=false;$('nameInput').value='';refreshList();setTimeout(()=>setSteps(-1),2500);
+  }else if(o.type==='enroll_failed'){
+    const m=o.msg||{};
+    if(m.event==='already_registered')log($('enrollLog'),'err','✗ Jari sudah terdaftar (ID '+m.id+', conf '+m.confidence+'). Batal.');
+    else log($('enrollLog'),'err','✗ Gagal daftar: '+JSON.stringify(m));
+    log($('dashLog'),'err','✗ Enrol gagal');
+    $('enrollBtn').disabled=false;setSteps(-1);
+  }else if(o.type==='scan'){
+    const m=o.msg||{};
+    if(m.event==='match'){
+      const box=$('scanBox');box.className='scan-box match';
+      $('scanName').textContent=m.name||'(tidak dikenal)';
+      $('scanSub').textContent='ID '+m.id+' • MATCH';
+      const conf=Math.max(0,Math.min(100,m.confidence||0));
+      $('confWrap').style.display='block';$('confFill').style.width=conf+'%';$('confTxt').textContent='confidence '+m.confidence;
+      log($('scanLog'),'ok','✓ MATCH  '+m.name+'  (ID '+m.id+', conf '+m.confidence+')');
+      log($('dashLog'),'ok','✓ Match: '+m.name+' (ID '+m.id+')');
+    }else if(m.event==='nomatch'){
+      const box=$('scanBox');box.className='scan-box nomatch';
+      $('scanName').textContent='TIDAK Dikenali';$('scanSub').textContent='NO MATCH (kode '+m.code+')';
+      $('confWrap').style.display='none';
+      log($('scanLog'),'err','✗ NO MATCH (kode '+m.code+')');
+      log($('dashLog'),'err','✗ No match');
+    }else if(m.event==='autoscan_err'){
+      log($('scanLog'),'warn','! error step '+m.step+' kode '+m.code);
+    }
+  }else if(o.type==='event'){
+    const m=o.msg||{};
+    const stepMap={waiting_clear:[0,'Menunggu jari diangkat...'],waiting_finger:[1,'Letakkan jari di sensor...'],waiting_finger_2:[4,'Letakkan jari yang SAMA lagi...'],remove:[3,'Angkat jari...'],image_ok_step1:[2,'Image ke-1 diterima, memproses...'],image_ok_step2:[5,'Image ke-2 diterima, membuat model...']};
+    if(stepMap[m.event]){setSteps(stepMap[m.event][0]);log($('enrollLog'),'muted','  '+stepMap[m.event][1]);}
+    else if(m.event==='diag'){const dm={image2Tz1:2,image2Tz2:5,createModel:6,store:7};if(dm[m.step])setSteps(dm[m.step]);log($('enrollLog'),'muted','  [diag] '+m.step+' → kode '+m.code);}
+    else if(m.event==='bad_image')log($('enrollLog'),'warn','  ! gambar jelek (step '+m.step+', kode '+m.code+'). ulangi.');
+    else if(m.event==='retry_create')log($('enrollLog'),'warn','  ! create gagal (kode '+m.code+'), ulang percobaan '+m.attempt);
+    else log($('enrollLog'),'muted','  '+JSON.stringify(m));
+  }else if(o.type==='raw'){log($('scanLog'),'muted',o.text);}
+}
+
+// Enroll
+$('enrollBtn').onclick=async()=>{const name=$('nameInput').value.trim();if(!name){log($('enrollLog'),'warn','isi nama dulu.');return;}clearLog($('enrollLog'));setSteps(-1);const r=await api('/api/enroll','POST',{name});if(!r.ok)log($('enrollLog'),'err','gagal mulai: '+(r.error||''));};
+$('nameInput').addEventListener('keydown',e=>{if(e.key==='Enter')$('enrollBtn').click();});
+
+// Scan
+function setScanUI(active){autoActive=active;$('scanOnBtn').disabled=active;$('scanOffBtn').disabled=!active;$('dScan').textContent=active?'AKTIF':'IDLE';$('dScan').style.color=active?'var(--info)':'var(--txt)';if(active){const b=$('scanBox');b.className='scan-box';$('scanName').textContent='Menunggu';$('scanSub').textContent='Letakkan jari di sensor...';$('confWrap').style.display='none';}}
+$('scanOnBtn').onclick=async()=>{clearLog($('scanLog'));const r=await api('/api/autoscan/on','POST');if(r.ok){setScanUI(true);log($('scanLog'),'info','scan aktif. letakkan jari...');log($('dashLog'),'info','scan dimulai');}else log($('scanLog'),'err','gagal mulai: '+(r.error||''));};
+$('scanOffBtn').onclick=async()=>{const r=await api('/api/autoscan/off','POST');setScanUI(false);log($('scanLog'),'muted','scan berhenti.');};
+
+// Data
+async function refreshList(){const[lst,cnt]=await Promise.all([api('/api/list'),api('/api/count')]);const db=lst||{};const ids=Object.keys(db).sort((a,b)=>a-b);$('tCount').textContent=cnt.count!=null?cnt.count:ids.length;$('dataCount').textContent=cnt.count!=null?cnt.count:ids.length;$('iCount').textContent=cnt.count!=null?cnt.count:ids.length;renderTable(db,ids);}
+function renderTable(db,ids){const q=($('searchInput').value||'').toLowerCase();const f=ids.filter(id=>(db[id]||'').toLowerCase().includes(q));const tb=$('tblBody');if(!f.length){tb.innerHTML='<tr><td colspan="3" class="empty">'+(q?'tidak ada yang cocok':'(kosong)')+'</td></tr>';return;}tb.innerHTML='';for(const id of f){const tr=document.createElement('tr');tr.innerHTML='<td class="id">'+id+'</td><td>'+esc(db[id])+'</td>';const td=document.createElement('td');td.className='act';const b=document.createElement('button');b.className='btn btn-dng';b.textContent='Hapus';b.onclick=()=>del(id,db[id]);td.appendChild(b);tr.appendChild(td);tb.appendChild(tr);}}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+async function del(id,name){if(!confirm('Hapus ID '+id+' ('+name+')?'))return;const r=await api('/api/delete','POST',{id:parseInt(id,10)});if(r.ok){refreshList();log($('dashLog'),'warn','dihapus: '+name+' (ID '+id+')');}else alert('gagal: '+(r.error||''));}
+$('refreshBtn').onclick=refreshList;
+$('searchInput').addEventListener('input',()=>{const db=window._db||{};renderTable(db,Object.keys(db).sort((a,b)=>a-b));});
+$('emptyBtn').onclick=async()=>{if(!confirm('Hapus SEMUA data di sensor?'))return;const r=await api('/api/empty','POST');if(r.ok){refreshList();log($('dashLog'),'warn','semua data dihapus');}else alert('gagal: '+(r.error||''));};
+// cache db for search
+const _origRefresh=refreshList;
+refreshList=async function(){const[lst,cnt]=await Promise.all([api('/api/list'),api('/api/count')]);const db=lst||{};window._db=db;const ids=Object.keys(db).sort((a,b)=>a-b);$('tCount').textContent=cnt.count!=null?cnt.count:ids.length;$('dataCount').textContent=cnt.count!=null?cnt.count:ids.length;$('iCount').textContent=cnt.count!=null?cnt.count:ids.length;renderTable(db,ids);};
+
+// uptime
+setInterval(()=>{if(readyAt){const s=Math.floor((Date.now()-readyAt)/1000);const m=Math.floor(s/60);$('dUptime').textContent=m+'m '+(s%60)+'s';}},1000);
+
+// init
+refreshList();
+api('/api/status').then(s=>{if(s&&s.ready){const i=s.ready;readyData=i;readyAt=Date.now();$('dot').className='dot ok';$('sideStatus').textContent='sensor siap';$('dStat').textContent='SIAP';$('dStat').style.color='var(--ok)';$('tBaud').textContent=i.baud;$('tSec').textContent=i.security;$('iStat').textContent='SIAP';$('iBaud').textContent=i.baud;$('iSec').textContent=i.security;$('iUart').textContent=i.uart||'-';}else{$('dot').className='dot bad';$('sideStatus').textContent='bridge belum siap';$('dStat').textContent='OFFLINE';$('dStat').style.color='var(--err)';}}).catch(()=>{$('dot').className='dot bad';$('sideStatus').textContent='bridge belum siap';$('dStat').textContent='OFFLINE';$('dStat').style.color='var(--err)';});
+</script>
+</body>
+</html>
