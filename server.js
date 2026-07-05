@@ -40,13 +40,38 @@ function saveDB(db) {
 const port = new SerialPort({ path: PORT, baudRate: BAUD, autoOpen: false });
 let buf = '';
 let readyResolve = null;
-const readyPromise = new Promise((r) => { readyResolve = r; });
+let readyPromise = new Promise((r) => { readyResolve = r; });
 
 let cmdResolve = null;     // response untuk perintah {ok:...}
 let enrollActive = false;  // sedang dalam sesi enrol (event -> SSE)
 let autoActive = false;    // sedang autoscan (event match/nomatch -> SSE)
 let pendingEnroll = null;  // {id, name} selama enrol berlangsung
 let readyInfo = null;      // payload event ready dari bridge
+
+async function reconnectSerial() {
+  try {
+    if (port.isOpen) {
+      await new Promise((r) => port.close(() => r()));
+    }
+  } catch {}
+  buf = '';
+  cmdResolve = null;
+  enrollActive = false;
+  autoActive = false;
+  pendingEnroll = null;
+  readyInfo = null;
+  readyResolve = null;
+  readyPromise = new Promise((r) => { readyResolve = r; });
+
+  try {
+    await new Promise((res, rej) => port.open((e) => e ? rej(e) : res()));
+    await Promise.race([readyPromise, new Promise((r) => setTimeout(r, 5000))]);
+    return { ok: true, info: readyInfo };
+  } catch (e) {
+    broadcast({ type: 'disconnected' });
+    return { ok: false, error: e.message };
+  }
+}
 
 // SSE clients
 const sseClients = new Set();
@@ -272,6 +297,12 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && p === '/api/empty') {
     try { const r = await sendCmd('EMPTY'); if (r.ok) saveDB({}); return sendJSON(res, r); }
     catch (e) { return sendJSON(res, { ok: false, error: e.message }, 500); }
+  }
+  if (req.method === 'POST' && p === '/api/reconnect') {
+    try {
+      const r = await reconnectSerial();
+      return sendJSON(res, r);
+    } catch (e) { return sendJSON(res, { ok: false, error: e.message }, 500); }
   }
   if (req.method === 'GET' && p === '/api/branches') {
     return apiProxy('/api/finger/branches', res);

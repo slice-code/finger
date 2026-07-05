@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('electron', {
     employees: (kodeCabang) => ipcRenderer.invoke('api:employees', kodeCabang),
     getConfig: () => ipcRenderer.invoke('api:getConfig'),
     setConfig: (cfg) => ipcRenderer.invoke('api:setConfig', cfg),
+    reconnect: () => ipcRenderer.invoke('api:reconnect'),
   },
   onEvent: (cb) => {
     const h = (_e, obj) => cb(obj);

@@ -8,8 +8,22 @@ const { SerialPort } = require('serialport');
 
 const PORT = process.env.PORT || '/dev/ttyUSB0';
 const BAUD = parseInt(process.env.BAUD || '9600', 10);
-const DB_PATH = path.join(__dirname, 'fingerprints.json');
-const CONFIG_PATH = path.join(__dirname, 'config.json');
+const userDataPath = app.getPath('userData');
+const DB_PATH = path.join(userDataPath, 'fingerprints.json');
+const CONFIG_PATH = path.join(userDataPath, 'config.json');
+
+function initDataFiles() {
+  const defaultsDir = path.join(process.resourcesPath || path.join(__dirname, '..'), 'defaults');
+  if (!fs.existsSync(CONFIG_PATH)) {
+    const src = path.join(defaultsDir, 'config.json');
+    if (fs.existsSync(src)) fs.copyFileSync(src, CONFIG_PATH);
+  }
+  if (!fs.existsSync(DB_PATH)) {
+    const src = path.join(defaultsDir, 'fingerprints.json');
+    if (fs.existsSync(src)) fs.copyFileSync(src, DB_PATH);
+  }
+}
+initDataFiles();
 
 function loadConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); }
@@ -39,7 +53,7 @@ function saveDB(db) {
 const port = new SerialPort({ path: PORT, baudRate: BAUD, autoOpen: false });
 let buf = '';
 let readyResolve = null;
-const readyPromise = new Promise((r) => { readyResolve = r; });
+let readyPromise = new Promise((r) => { readyResolve = r; });
 
 let cmdResolve = null;
 let enrollActive = false;
@@ -219,6 +233,31 @@ ipcMain.handle('api:getConfig', () => loadConfig());
 ipcMain.handle('api:setConfig', (_e, cfg) => {
   saveConfig(cfg);
   return { ok: true };
+});
+
+ipcMain.handle('api:reconnect', async () => {
+  try {
+    if (port.isOpen) {
+      await new Promise((r) => port.close(() => r()));
+    }
+  } catch {}
+  buf = '';
+  cmdResolve = null;
+  enrollActive = false;
+  autoActive = false;
+  pendingEnroll = null;
+  readyInfo = null;
+  readyResolve = null;
+  readyPromise = new Promise((r) => { readyResolve = r; });
+
+  try {
+    await new Promise((res, rej) => port.open((e) => e ? rej(e) : res()));
+    await Promise.race([readyPromise, new Promise((r) => setTimeout(r, 5000))]);
+    return { ok: true, info: readyInfo };
+  } catch (e) {
+    broadcast('bridge-event', { type: 'disconnected' });
+    return { ok: false, error: e.message };
+  }
 });
 
 // ---------- Window ----------

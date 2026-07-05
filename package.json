@@ -12,13 +12,42 @@
     "electron": "electron .",
     "electron:nosandbox": "electron . --no-sandbox",
     "web": "node server.js",
-    "rebuild:electron": "electron-rebuild -f -w serialport"
+    "rebuild:electron": "electron-rebuild -f -w serialport",
+    "build": "electron-builder",
+    "build:linux": "electron-builder --linux"
   },
   "dependencies": {
     "serialport": "^12.0.0"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.1.0",
-    "electron": "^31.0.0"
+    "electron": "^31.0.0",
+    "electron-builder": "^25.1.0"
+  },
+  "build": {
+    "appId": "com.fpm10a.fingerconsole",
+    "productName": "FPM10A Finger Console",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron-main.js",
+      "preload.js",
+      "public/**",
+      "node_modules/**"
+    ],
+    "extraResources": [
+      { "from": "config.json", "to": "defaults/config.json" },
+      { "from": "fingerprints.json", "to": "defaults/fingerprints.json" }
+    ],
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Utility",
+      "maintainer": "fpm10a-team"
+    },
+    "asarUnpack": [
+      "node_modules/serialport/**",
+      "node_modules/@serialport/**"
+    ]
   }
 }
