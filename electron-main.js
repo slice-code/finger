@@ -3,11 +3,28 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const http = require('http');
 const { SerialPort } = require('serialport');
 
 const PORT = process.env.PORT || '/dev/ttyUSB0';
 const BAUD = parseInt(process.env.BAUD || '9600', 10);
 const DB_PATH = path.join(__dirname, 'fingerprints.json');
+const CONFIG_PATH = path.join(__dirname, 'config.json');
+
+function loadConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); }
+  catch { return { apiBaseUrl: 'http://192.168.1.15:3004' }; }
+}
+function saveConfig(cfg) {
+  const c = loadConfig();
+  Object.assign(c, cfg);
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 2));
+  config = c;
+  API_BASE = c.apiBaseUrl || 'http://192.168.1.15:3004';
+}
+
+let config = loadConfig();
+let API_BASE = config.apiBaseUrl || 'http://192.168.1.15:3004';
 
 // ---------- DB ----------
 function loadDB() {
@@ -52,7 +69,21 @@ function handleLine(raw) {
   if (msg.event === 'match' || msg.event === 'nomatch' || msg.event === 'autoscan_err') {
     if (msg.event === 'match') {
       const db = loadDB();
-      msg.name = db[String(msg.id)] || '(tidak dikenal)';
+      const entry = db[String(msg.id)];
+      msg.name = typeof entry === 'object' ? (entry.name || '(tidak dikenal)') : (entry || '(tidak dikenal)');
+      msg.employeeId = typeof entry === 'object' ? (entry.employeeId || null) : null;
+
+      if (msg.employeeId && config.kode_cabang) {
+        apiPost('/api/finger/arduino/attendance', {
+          employeeId: msg.employeeId,
+          device_id: config.device_id || 'arduino-001',
+          kode_cabang: config.kode_cabang,
+        }).then(apiRes => {
+          broadcast('bridge-event', { type: 'attendance', msg: apiRes });
+        }).catch(err => {
+          broadcast('bridge-event', { type: 'attendance', msg: { status: 'error', message: err.message } });
+        });
+      }
     }
     broadcast('bridge-event', { type: 'scan', msg });
     return;
@@ -64,9 +95,9 @@ function handleLine(raw) {
 
   if (msg.event === 'enrolled' && pendingEnroll) {
     const db = loadDB();
-    db[String(msg.id)] = pendingEnroll.name;
+    db[String(msg.id)] = { name: pendingEnroll.name, employeeId: pendingEnroll.employeeId || null };
     saveDB(db);
-    broadcast('bridge-event', { type: 'enroll_done', id: msg.id, name: pendingEnroll.name });
+    broadcast('bridge-event', { type: 'enroll_done', id: msg.id, name: pendingEnroll.name, employeeId: pendingEnroll.employeeId || null });
     pendingEnroll = null;
     enrollActive = false;
     return;
@@ -105,20 +136,57 @@ function sendCmd(cmd, timeoutMs = 10000) {
   });
 }
 
+function apiGet(path) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(path, API_BASE);
+    http.get(url.toString(), (res) => {
+      let data = '';
+      res.on('data', (c) => data += c);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(data); } });
+    }).on('error', reject);
+  });
+}
+
+function apiPost(path, body) {
+  return new Promise((resolve, reject) => {
+    const postData = JSON.stringify(body);
+    const url = new URL(path, API_BASE);
+    const options = {
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData),
+      },
+    };
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', (c) => data += c);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(data); } });
+    });
+    req.on('error', reject);
+    req.write(postData);
+    req.end();
+  });
+}
+
 // ---------- IPC ----------
 ipcMain.handle('api:list', () => loadDB());
 ipcMain.handle('api:count', async () => { try { return await sendCmd('COUNT'); } catch (e) { return { ok: false, error: e.message }; } });
 ipcMain.handle('api:status', () => ({ ready: readyInfo, autoActive }));
 ipcMain.handle('api:enroll', async (_e, body) => {
   const name = (body && body.name || '').trim();
+  const employeeId = (body && body.employeeId) || null;
   if (!name) return { ok: false, error: 'name_empty' };
   if (enrollActive) return { ok: false, error: 'enroll_busy' };
   try {
     const c = await sendCmd('COUNT');
     const id = (c.count || 0) + 1;
     enrollActive = true;
-    pendingEnroll = { id, name };
-    broadcast('bridge-event', { type: 'enroll_start', id, name });
+    pendingEnroll = { id, name, employeeId };
+    broadcast('bridge-event', { type: 'enroll_start', id, name, employeeId });
     send('ENROLL ' + id).catch(() => {});
     return { ok: true, id, name };
   } catch (e) { return { ok: false, error: e.message }; }
@@ -141,6 +209,16 @@ ipcMain.handle('api:delete', async (_e, body) => {
 ipcMain.handle('api:empty', async () => {
   try { const r = await sendCmd('EMPTY'); if (r.ok) saveDB({}); return r; }
   catch (e) { return { ok: false, error: e.message }; }
+});
+ipcMain.handle('api:branches', () => apiGet('/api/finger/branches'));
+ipcMain.handle('api:employees', (_e, kodeCabang) => {
+  const query = kodeCabang ? `?kode_cabang=${encodeURIComponent(kodeCabang)}` : '';
+  return apiGet(`/api/finger/employees${query}`);
+});
+ipcMain.handle('api:getConfig', () => loadConfig());
+ipcMain.handle('api:setConfig', (_e, cfg) => {
+  saveConfig(cfg);
+  return { ok: true };
 });
 
 // ---------- Window ----------

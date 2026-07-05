@@ -63,6 +63,9 @@
   /* forms */
   input[type=text]{width:100%;padding:11px 13px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;color:var(--txt);font-size:14px}
   input[type=text]:focus{outline:none;border-color:var(--accent)}
+  select{width:100%;padding:11px 13px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;color:var(--txt);font-size:14px;cursor:pointer}
+  select:focus{outline:none;border-color:var(--accent)}
+  select:disabled{opacity:.5;cursor:not-allowed}
   .btn{padding:10px 16px;border:1px solid transparent;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:.15s;display:inline-flex;align-items:center;gap:7px}
   .btn svg{width:16px;height:16px}
   .btn:disabled{opacity:.5;cursor:not-allowed}
@@ -91,17 +94,42 @@
   .ok{color:#4ade80}.err{color:#f87171}.info{color:#7dd3fc}.warn{color:#fbbf24}.muted{color:#64748b}
 
   /* scan result */
-  .scan-box{border-radius:14px;padding:26px;text-align:center;border:1px solid var(--border);background:radial-gradient(circle at 50% 0%,rgba(59,130,246,.10),transparent 70%);margin-bottom:14px;min-height:150px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px}
-  .scan-box.match{border-color:rgba(34,197,94,.5);background:radial-gradient(circle at 50% 0%,rgba(34,197,94,.16),transparent 70%)}
-  .scan-box.nomatch{border-color:rgba(239,68,68,.5);background:radial-gradient(circle at 50% 0%,rgba(239,68,68,.16),transparent 70%)}
-  .scan-ico{width:54px;height:54px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin-bottom:6px;background:var(--panel2)}
-  .scan-ico svg{width:28px;height:28px}
-  .scan-name{font-size:22px;font-weight:700}
-  .scan-sub{font-size:13px;color:var(--muted)}
-  .conf-wrap{width:60%;max-width:280px;margin-top:10px}
-  .conf-bar{height:8px;border-radius:4px;background:var(--border);overflow:hidden}
+  .scan-box{border-radius:16px;padding:30px 26px 24px;text-align:center;border:2px solid var(--border);background:radial-gradient(circle at 50% 0%,rgba(59,130,246,.08),transparent 70%);margin-bottom:14px;min-height:180px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;transition:border-color .35s,background .35s,box-shadow .35s;position:relative;overflow:hidden}
+  .scan-box::after{content:'';position:absolute;inset:0;border-radius:16px;opacity:0;transition:opacity .4s;pointer-events:none;z-index:0}
+  .scan-box.scanning{border-color:rgba(56,189,248,.5);background:radial-gradient(circle at 50% 0%,rgba(56,189,248,.12),transparent 70%);box-shadow:0 0 30px rgba(56,189,248,.08)}
+  .scan-box.detected{border-color:rgba(34,197,94,.5);background:radial-gradient(circle at 50% 0%,rgba(34,197,94,.14),transparent 70%)}
+  .scan-box.checkin{border-color:rgba(34,197,94,.7);background:radial-gradient(circle at 50% 0%,rgba(34,197,94,.2),transparent 70%);box-shadow:0 0 40px rgba(34,197,94,.12)}
+  .scan-box.checkout{border-color:rgba(96,165,250,.7);background:radial-gradient(circle at 50% 0%,rgba(96,165,250,.2),transparent 70%);box-shadow:0 0 40px rgba(96,165,250,.12)}
+  .scan-box.nomatch{border-color:rgba(239,68,68,.6);background:radial-gradient(circle at 50% 0%,rgba(239,68,68,.16),transparent 70%);box-shadow:0 0 30px rgba(239,68,68,.08)}
+  .scan-box.ignored{border-color:rgba(245,158,11,.6);background:radial-gradient(circle at 50% 0%,rgba(245,158,11,.16),transparent 70%);box-shadow:0 0 30px rgba(245,158,11,.08)}
+  .scan-box.error{border-color:rgba(239,68,68,.6);background:radial-gradient(circle at 50% 0%,rgba(239,68,68,.14),transparent 70%);box-shadow:0 0 30px rgba(239,68,68,.08)}
+  .scan-status-icon{width:72px;height:72px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin-bottom:8px;background:var(--panel2);border:2px solid var(--border);transition:border-color .35s,background .35s,box-shadow .35s;position:relative;z-index:1}
+  .scan-status-icon svg{width:36px;height:36px;transition:color .35s}
+  .scan-status-icon.pulse{animation:scanPulse 1.8s ease-in-out infinite}
+  @keyframes scanPulse{0%,100%{box-shadow:0 0 0 0 rgba(56,189,248,.4)}50%{box-shadow:0 0 0 14px rgba(56,189,248,0)}}
+  .scan-box.checkin .scan-status-icon{border-color:var(--ok);background:rgba(34,197,94,.12);box-shadow:0 0 20px rgba(34,197,94,.2)}
+  .scan-box.checkout .scan-status-icon{border-color:var(--accent2);background:rgba(96,165,250,.12);box-shadow:0 0 20px rgba(96,165,250,.2)}
+  .scan-box.detected .scan-status-icon{border-color:var(--ok);background:rgba(34,197,94,.08)}
+  .scan-box.nomatch .scan-status-icon{border-color:var(--err);background:rgba(239,68,68,.08)}
+  .scan-box.ignored .scan-status-icon{border-color:var(--warn);background:rgba(245,158,11,.08)}
+  .scan-status-badge{display:inline-block;padding:5px 14px;border-radius:20px;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;position:relative;z-index:1;transition:all .35s}
+  .badge-idle{background:rgba(148,163,184,.12);color:var(--muted)}
+  .badge-scanning{background:rgba(56,189,248,.18);color:#7dd3fc}
+  .badge-detected{background:rgba(34,197,94,.18);color:#6ee7a8}
+  .badge-checkin{background:rgba(34,197,94,.22);color:#4ade80}
+  .badge-checkout{background:rgba(96,165,250,.22);color:#93c5fd}
+  .badge-notfound{background:rgba(239,68,68,.18);color:#fca5a5}
+  .badge-ignored{background:rgba(245,158,11,.18);color:#fcd34d}
+  .badge-error{background:rgba(239,68,68,.18);color:#fca5a5}
+  .scan-name{font-size:24px;font-weight:700;line-height:1.2;position:relative;z-index:1}
+  .scan-empid{font-size:13px;color:var(--accent2);font-family:ui-monospace,Consolas,monospace;position:relative;z-index:1}
+  .scan-time{font-size:26px;font-weight:700;font-family:ui-monospace,Consolas,monospace;color:var(--txt);position:relative;z-index:1;margin-top:4px}
+  .scan-conf-row{width:70%;max-width:300px;margin-top:8px;position:relative;z-index:1}
+  .conf-bar{height:6px;border-radius:3px;background:var(--border);overflow:hidden}
   .conf-fill{height:100%;background:linear-gradient(90deg,#22c55e,#84cc16);transition:width .4s}
-  .conf-txt{font-size:11px;color:var(--muted);margin-top:4px}
+  .conf-txt{font-size:10.5px;color:var(--muted);margin-top:3px}
+  @keyframes scanFadeIn{from{opacity:0;transform:scale(.92)}to{opacity:1;transform:scale(1)}}
+  .scan-box.fade-in{animation:scanFadeIn .3s ease-out}
 
   /* table */
   table{width:100%;border-collapse:collapse;font-size:14px}
@@ -153,6 +181,10 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
       Info Sensor
     </div>
+    <div class="nav-item" data-sec="settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      Pengaturan
+    </div>
   </nav>
   <div class="side-foot"><span id="dot" class="dot"></span><span id="sideStatus">menghubungkan...</span></div>
 </aside>
@@ -198,9 +230,13 @@
   <div class="section" id="sec-enroll">
     <div class="card">
       <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg> Pendaftaran Sidik Jari</h2>
+      <div class="row" style="margin-bottom:10px">
+        <select id="branchSelect" class="grow"><option value="">-- Loading cabang... --</option></select>
+        <button class="btn btn-sec" id="branchRefreshBtn" title="Muat ulang cabang">↻</button>
+      </div>
       <div class="row" style="margin-bottom:14px">
-        <input type="text" id="nameInput" class="grow" placeholder="Nama pemilik (mis. liz)" autocomplete="off">
-        <button class="btn btn-ok" id="enrollBtn">Mulai Daftar</button>
+        <select id="employeeSelect" class="grow" disabled><option value="">-- Pilih Cabang dulu --</option></select>
+        <button class="btn btn-ok" id="enrollBtn" disabled>Mulai Daftar</button>
       </div>
       <div class="step-labels"><span>Bersih</span><span>Jari 1</span><span>Proses 1</span><span>Angkat</span><span>Jari 2</span><span>Proses 2</span><span>Model</span><span>Simpan</span></div>
       <div class="steps" id="steps">
@@ -217,10 +253,14 @@
     <div class="card">
       <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Pencocokan Sidik Jari</h2>
       <div class="scan-box" id="scanBox">
-        <div class="scan-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 11c0-3-2-5-2-5"/><path d="M12 11c0-1.5-1-3-1-3"/><path d="M12 11c0-3 2-5 2-5"/><path d="M8 14c0 2 2 4 4 4s4-2 4-4-2-6-4-6-4 4-4 6z"/></svg></div>
-        <div class="scan-name" id="scanName">Idle</div>
-        <div class="scan-sub" id="scanSub">Tekan "Mulai Scan" lalu letakkan jari</div>
-        <div class="conf-wrap" id="confWrap" style="display:none"><div class="conf-bar"><div class="conf-fill" id="confFill"></div></div><div class="conf-txt" id="confTxt"></div></div>
+        <div class="scan-status-icon" id="scanIcon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 11c0-3-2-5-2-5"/><path d="M12 11c0-1.5-1-3-1-3"/><path d="M12 11c0-3 2-5 2-5"/><path d="M8 14c0 2 2 4 4 4s4-2 4-4-2-6-4-6-4 4-4 6z"/></svg>
+        </div>
+        <div class="scan-status-badge badge-idle" id="scanBadge">IDLE</div>
+        <div class="scan-name" id="scanName">Siap memindai</div>
+        <div class="scan-empid" id="scanEmpId" style="display:none"></div>
+        <div class="scan-time" id="scanTime" style="display:none"></div>
+        <div class="scan-conf-row" id="scanConfRow" style="display:none"><div class="conf-bar"><div class="conf-fill" id="confFill"></div></div><div class="conf-txt" id="confTxt"></div></div>
       </div>
       <div class="row" style="margin-bottom:12px">
         <button class="btn btn-pri" id="scanOnBtn">Mulai Scan</button>
@@ -236,8 +276,8 @@
       <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg> Daftar Sidik Jari Terdaftar <span class="badge" id="dataCount">0</span></h2>
       <div class="row search"><input type="text" id="searchInput" placeholder="Cari nama..." class="grow"><button class="btn btn-sec" id="refreshBtn">Muat Ulang</button></div>
       <table>
-        <thead><tr><th>ID</th><th>Nama</th><th style="text-align:right">Aksi</th></tr></thead>
-        <tbody id="tblBody"><tr><td colspan="3" class="empty">memuat...</td></tr></tbody>
+        <thead><tr><th>ID</th><th>Nama</th><th>Employee ID</th><th style="text-align:right">Aksi</th></tr></thead>
+        <tbody id="tblBody"><tr><td colspan="4" class="empty">memuat...</td></tr></tbody>
       </table>
       <div class="row" style="margin-top:14px"><button class="btn btn-dng" id="emptyBtn">Hapus Semua Data</button></div>
     </div>
@@ -263,11 +303,42 @@
   </div>
 
   </div>
+
+  <!-- SETTINGS -->
+  <div class="section" id="sec-settings">
+    <div class="grid g-2">
+      <div class="card">
+        <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg> API Server</h2>
+        <div class="row" style="margin-bottom:10px">
+          <input type="text" id="apiUrlInput" class="grow" placeholder="http://192.168.1.15:3004" autocomplete="off">
+          <button class="btn btn-ok" id="saveApiUrlBtn">Simpan</button>
+        </div>
+        <div class="hint">URL API server untuk sync data karyawan (cabang & karyawan).</div>
+        <div style="margin-top:12px;font-size:12px;color:var(--muted)" id="apiStatus"></div>
+      </div>
+      <div class="card">
+        <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/><line x1="6" y1="12" x2="6" y2="12"/></svg> Parameter Absensi</h2>
+        <div style="margin-bottom:10px">
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Kode Cabang</label>
+          <input type="text" id="kodeCabangInput" class="grow" placeholder="CKS" autocomplete="off">
+        </div>
+        <div style="margin-bottom:12px">
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:4px">Device ID</label>
+          <input type="text" id="deviceIdInput" class="grow" placeholder="arduino-001" autocomplete="off">
+        </div>
+        <button class="btn btn-ok" id="saveAbsensiBtn">Simpan</button>
+        <div style="margin-top:12px;font-size:12px;color:var(--muted)" id="absensiStatus"></div>
+        <div class="hint">Data ini dikirim ke API server saat absensi fingerprint terdeteksi.</div>
+      </div>
+    </div>
+  </div>
+
+  </div>
 </div>
 
 <script>
 const $=(id)=>document.getElementById(id);
-const TITLES={dash:['Dashboard','Ringkasan status & aktivitas'],enroll:['Daftar Sidik Jari','Pendaftaran 2-langkah'],scan:['Scan & Cocokkan','Pencocokan real-time'],data:['Data Terdaftar','Kelola sidik jari tersimpan'],info:['Info Sensor','Parameter & dokumentasi']};
+const TITLES={dash:['Dashboard','Ringkasan status & aktivitas'],enroll:['Daftar Sidik Jari','Pendaftaran 2-langkah'],scan:['Scan & Cocokkan','Pencocokan real-time'],data:['Data Terdaftar','Kelola sidik jari tersimpan'],info:['Info Sensor','Parameter & dokumentasi'],settings:['Pengaturan','Konfigurasi aplikasi']};
 function go(sec){
   document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));
   $('sec-'+sec).classList.add('active');
@@ -281,6 +352,7 @@ function log(el,cls,txt){const d=document.createElement('div');d.className='ln '
 function clearLog(el){el.innerHTML='';}
 
 let autoActive=false, readyAt=0, readyData=null;
+let lastMatch=null;
 
 const _EL=window.electron;
 async function api(path,method='GET',body=null){
@@ -294,6 +366,10 @@ async function api(path,method='GET',body=null){
       case '/api/autoscan/off': return _EL.api.autoscanOff();
       case '/api/delete': return _EL.api.delete(body);
       case '/api/empty': return _EL.api.empty();
+      case '/api/branches': return _EL.api.branches();
+      case '/api/employees': return _EL.api.employees(body ? body.kode_cabang : '');
+      case '/api/getConfig': return _EL.api.getConfig();
+      case '/api/setConfig': return _EL.api.setConfig(body);
       default: return {ok:false,error:'not_found'};
     }
   }
@@ -308,6 +384,138 @@ function setSteps(n){
   document.querySelectorAll('#steps .step').forEach((s,i)=>{s.classList.remove('active','done');if(i<n)s.classList.add('done');else if(i===n)s.classList.add('active');});
 }
 
+async function loadConfigUI(){
+  try {
+    const cfg = _EL ? await _EL.api.getConfig() : await (await fetch('/api/config')).json();
+    $('apiUrlInput').value = cfg.apiBaseUrl || '';
+    $('kodeCabangInput').value = cfg.kode_cabang || '';
+    $('deviceIdInput').value = cfg.device_id || '';
+  } catch (e) {
+    $('apiStatus').textContent = 'Gagal memuat konfigurasi';
+  }
+}
+
+async function saveConfigUI(){
+  const url = $('apiUrlInput').value.trim();
+  if (!url) { $('apiStatus').textContent = 'URL tidak boleh kosong'; return; }
+  $('saveApiUrlBtn').disabled = true;
+  $('apiStatus').textContent = 'Menyimpan...';
+  try {
+    const cfg = { apiBaseUrl: url };
+    const r = _EL ? await _EL.api.setConfig(cfg) : await (await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) })).json();
+    if (r.ok) {
+      $('apiStatus').textContent = '✓ Tersimpan. Reload data...';
+      $('apiStatus').style.color = 'var(--ok)';
+      loadBranches();
+      if ($('branchSelect').value) loadEmployees($('branchSelect').value);
+    } else {
+      $('apiStatus').textContent = 'Gagal: ' + (r.error || '');
+      $('apiStatus').style.color = 'var(--err)';
+    }
+  } catch (e) {
+    $('apiStatus').textContent = 'Gagal: ' + e.message;
+    $('apiStatus').style.color = 'var(--err)';
+  }
+  $('saveApiUrlBtn').disabled = false;
+}
+
+$('saveApiUrlBtn').onclick = saveConfigUI;
+$('apiUrlInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') saveConfigUI(); });
+
+async function saveAbsensiUI(){
+  const kodeCabang = $('kodeCabangInput').value.trim();
+  const deviceId = $('deviceIdInput').value.trim();
+  if (!kodeCabang && !deviceId) { $('absensiStatus').textContent = 'Isi minimal satu field'; $('absensiStatus').style.color = 'var(--err)'; return; }
+  $('saveAbsensiBtn').disabled = true;
+  $('absensiStatus').textContent = 'Menyimpan...';
+  $('absensiStatus').style.color = 'var(--muted)';
+  try {
+    const cfg = { kode_cabang: kodeCabang, device_id: deviceId };
+    const r = _EL ? await _EL.api.setConfig(cfg) : await (await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) })).json();
+    if (r.ok) {
+      $('absensiStatus').textContent = '✓ Tersimpan';
+      $('absensiStatus').style.color = 'var(--ok)';
+    } else {
+      $('absensiStatus').textContent = 'Gagal: ' + (r.error || '');
+      $('absensiStatus').style.color = 'var(--err)';
+    }
+  } catch (e) {
+    $('absensiStatus').textContent = 'Gagal: ' + e.message;
+    $('absensiStatus').style.color = 'var(--err)';
+  }
+  $('saveAbsensiBtn').disabled = false;
+}
+
+$('saveAbsensiBtn').onclick = saveAbsensiUI;
+
+async function fetchBranches(){
+  if(_EL) return _EL.api.branches();
+  const r = await fetch('/api/branches');
+  return r.json();
+}
+
+async function fetchEmployees(kodeCabang){
+  if(_EL) return _EL.api.employees(kodeCabang);
+  const r = await fetch(`/api/employees?kode_cabang=${encodeURIComponent(kodeCabang)}`);
+  return r.json();
+}
+
+async function loadBranches(){
+  const sel = $('branchSelect');
+  sel.innerHTML = '<option value="">-- Loading... --</option>';
+  try {
+    const data = await fetchBranches();
+    const branches = data.success ? data.data : data;
+    sel.innerHTML = '<option value="">-- Pilih Cabang --</option>';
+    const arr = Array.isArray(branches) ? branches : [];
+    for (const b of arr) {
+      const opt = document.createElement('option');
+      opt.value = b.kode_cabang;
+      opt.textContent = `${b.nama_cabang} (${b.kode_cabang})`;
+      sel.appendChild(opt);
+    }
+    if (!arr.length) sel.innerHTML = '<option value="">-- Tidak ada cabang --</option>';
+  } catch (e) {
+    sel.innerHTML = '<option value="">-- Gagal memuat cabang --</option>';
+    log($('dashLog'),'err','Gagal memuat daftar cabang: '+e.message);
+  }
+}
+
+async function loadEmployees(kodeCabang){
+  const sel = $('employeeSelect');
+  const btn = $('enrollBtn');
+  if (!kodeCabang) {
+    sel.innerHTML = '<option value="">-- Pilih Cabang dulu --</option>';
+    sel.disabled = true;
+    btn.disabled = true;
+    return;
+  }
+  sel.innerHTML = '<option value="">-- Loading... --</option>';
+  sel.disabled = false;
+  btn.disabled = true;
+  try {
+    const data = await fetchEmployees(kodeCabang);
+    const employees = Array.isArray(data) ? data : (data.data || []);
+    sel.innerHTML = '<option value="">-- Pilih Karyawan --</option>';
+    let count = 0;
+    for (const emp of employees) {
+      if (emp.finger_terdaftar) continue;
+      const opt = document.createElement('option');
+      opt.value = emp.id;
+      opt.textContent = `${emp.nama} (${emp.id})`;
+      opt.dataset.nama = emp.nama;
+      sel.appendChild(opt);
+      count++;
+    }
+    if (!count) {
+      sel.innerHTML = '<option value="">-- Semua sudah terdaftar --</option>';
+    }
+  } catch (e) {
+    sel.innerHTML = '<option value="">-- Gagal memuat --</option>';
+    log($('dashLog'),'err','Gagal memuat daftar karyawan: '+e.message);
+  }
+}
+
 function handle(o){
   if(o.type==='ready'){
     readyData=o.info||{};readyAt=Date.now();
@@ -319,38 +527,106 @@ function handle(o){
     log($('dashLog'),'info','Bridge siap • baud '+i.baud+' • security '+i.security);
   }else if(o.type==='enroll_start'){
     go('enroll');
-    log($('enrollLog'),'info','Mulai daftar ID '+o.id+' ('+o.name+'). Letakkan jari...');
-    log($('dashLog'),'info','Enrol dimulai: '+o.name+' (ID '+o.id+')');
+    log($('enrollLog'),'info','Mulai daftar '+o.employeeId+' ('+o.name+'). Letakkan jari...');
+    log($('dashLog'),'info','Enrol dimulai: '+o.name+' ('+o.employeeId+')');
     $('enrollBtn').disabled=true;setSteps(0);
   }else if(o.type==='enroll_done'){
     setSteps(8);document.querySelectorAll('#steps .step').forEach(s=>{s.classList.remove('active');s.classList.add('done');});
-    log($('enrollLog'),'ok','✓ Sukses! "'+o.name+'" tersimpan (ID '+o.id+').');
-    log($('dashLog'),'ok','✓ Enrol selesai: '+o.name+' (ID '+o.id+')');
-    $('enrollBtn').disabled=false;$('nameInput').value='';refreshList();setTimeout(()=>setSteps(-1),2500);
+    log($('enrollLog'),'ok','\u2713 Sukses! "'+o.name+'" ('+o.employeeId+') tersimpan (ID '+o.id+').');
+    log($('dashLog'),'ok','\u2713 Enrol selesai: '+o.name+' ('+o.employeeId+')');
+    $('enrollBtn').disabled=false;
+    refreshList();setTimeout(()=>setSteps(-1),2500);
+    if($('branchSelect').value) loadEmployees($('branchSelect').value);
   }else if(o.type==='enroll_failed'){
     const m=o.msg||{};
-    if(m.event==='already_registered')log($('enrollLog'),'err','✗ Jari sudah terdaftar (ID '+m.id+', conf '+m.confidence+'). Batal.');
-    else log($('enrollLog'),'err','✗ Gagal daftar: '+JSON.stringify(m));
-    log($('dashLog'),'err','✗ Enrol gagal');
+    if(m.event==='already_registered')log($('enrollLog'),'err','\u2717 Jari sudah terdaftar (ID '+m.id+', conf '+m.confidence+'). Batal.');
+    else log($('enrollLog'),'err','\u2717 Gagal daftar: '+JSON.stringify(m));
+    log($('dashLog'),'err','\u2717 Enrol gagal');
     $('enrollBtn').disabled=false;setSteps(-1);
+    if($('branchSelect').value) loadEmployees($('branchSelect').value);
   }else if(o.type==='scan'){
     const m=o.msg||{};
     if(m.event==='match'){
-      const box=$('scanBox');box.className='scan-box match';
+      lastMatch={name:m.name,employeeId:m.employeeId,confidence:m.confidence,id:m.id};
+      const box=$('scanBox');box.className='scan-box detected fade-in';
+      $('scanIcon').innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>';
+      $('scanIcon').classList.remove('pulse');
+      $('scanBadge').textContent='TERDETEKSI';$('scanBadge').className='scan-status-badge badge-detected';
       $('scanName').textContent=m.name||'(tidak dikenal)';
-      $('scanSub').textContent='ID '+m.id+' • MATCH';
+      $('scanEmpId').textContent=m.employeeId||'';$('scanEmpId').style.display=m.employeeId?'block':'none';
+      $('scanTime').style.display='none';
       const conf=Math.max(0,Math.min(100,m.confidence||0));
-      $('confWrap').style.display='block';$('confFill').style.width=conf+'%';$('confTxt').textContent='confidence '+m.confidence;
-      log($('scanLog'),'ok','✓ MATCH  '+m.name+'  (ID '+m.id+', conf '+m.confidence+')');
-      log($('dashLog'),'ok','✓ Match: '+m.name+' (ID '+m.id+')');
+      $('scanConfRow').style.display='block';$('confFill').style.width=conf+'%';$('confTxt').textContent='confidence '+m.confidence;
+      log($('scanLog'),'ok','✓ TERDETEKSI  '+m.name+(m.employeeId?' ('+m.employeeId+')':'')+'  (ID '+m.id+', conf '+m.confidence+')');
+      log($('dashLog'),'ok','✓ Match: '+m.name+(m.employeeId?' ('+m.employeeId+')':'')+' (ID '+m.id+')');
     }else if(m.event==='nomatch'){
-      const box=$('scanBox');box.className='scan-box nomatch';
-      $('scanName').textContent='TIDAK Dikenali';$('scanSub').textContent='NO MATCH (kode '+m.code+')';
-      $('confWrap').style.display='none';
+      const box=$('scanBox');box.className='scan-box nomatch fade-in';
+      $('scanIcon').innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
+      $('scanIcon').classList.remove('pulse');
+      $('scanBadge').textContent='TIDAK DIKENALI';$('scanBadge').className='scan-status-badge badge-notfound';
+      $('scanName').textContent='Tidak dikenali';$('scanEmpId').style.display='none';$('scanTime').style.display='none';$('scanConfRow').style.display='none';
       log($('scanLog'),'err','✗ NO MATCH (kode '+m.code+')');
       log($('dashLog'),'err','✗ No match');
     }else if(m.event==='autoscan_err'){
       log($('scanLog'),'warn','! error step '+m.step+' kode '+m.code);
+    }
+  }else if(o.type==='attendance'){
+    const m=o.msg||{};
+    const box=$('scanBox');
+    const empId=m.employeeId||(lastMatch?lastMatch.employeeId:'');
+    const nama=m.name||m.nama||(lastMatch?lastMatch.name:'');
+    if(m.status==='checkin'){
+      box.className='scan-box checkin fade-in';
+      $('scanIcon').innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>';
+      $('scanIcon').classList.remove('pulse');
+      $('scanBadge').textContent='ABSEN MASUK';$('scanBadge').className='scan-status-badge badge-checkin';
+      $('scanName').textContent=nama||'Berhasil';
+      $('scanEmpId').textContent=empId;$('scanEmpId').style.display=empId?'block':'none';
+      $('scanTime').textContent=m.time||'';$('scanTime').style.display=m.time?'block':'none';
+      $('scanConfRow').style.display='none';
+      log($('scanLog'),'ok','✓ ABSEN MASUK  '+nama+(empId?' ('+empId+')':'')+(m.time?'  '+m.time:''));
+      log($('dashLog'),'ok','✓ Absen Masuk: '+nama+' ('+(m.message||'')+')');
+    }else if(m.status==='checkout'){
+      box.className='scan-box checkout fade-in';
+      $('scanIcon').innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3h4a3 3 0 0 1 3 3v1"/></svg>';
+      $('scanIcon').classList.remove('pulse');
+      $('scanBadge').textContent='ABSEN PULANG';$('scanBadge').className='scan-status-badge badge-checkout';
+      $('scanName').textContent=nama||'Berhasil';
+      $('scanEmpId').textContent=empId;$('scanEmpId').style.display=empId?'block':'none';
+      $('scanTime').textContent=m.time||'';$('scanTime').style.display=m.time?'block':'none';
+      $('scanConfRow').style.display='none';
+      log($('scanLog'),'ok','✓ ABSEN PULANG  '+nama+(empId?' ('+empId+')':'')+(m.time?'  '+m.time:''));
+      log($('dashLog'),'ok','✓ Absen Pulang: '+nama+' ('+(m.message||'')+')');
+    }else if(m.status==='not_found'){
+      box.className='scan-box nomatch fade-in';
+      $('scanIcon').innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
+      $('scanIcon').classList.remove('pulse');
+      $('scanBadge').textContent='TIDAK DIKENALI';$('scanBadge').className='scan-status-badge badge-notfound';
+      $('scanName').textContent=m.message||'Sidik jari tidak dikenal';
+      $('scanEmpId').style.display='none';$('scanTime').style.display='none';$('scanConfRow').style.display='none';
+      log($('scanLog'),'err','✗ '+(m.message||'Sidik jari tidak dikenal (API)'));
+      log($('dashLog'),'err','✗ API not_found');
+    }else if(m.status==='ignored'){
+      box.className='scan-box ignored fade-in';
+      $('scanIcon').innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>';
+      $('scanIcon').classList.remove('pulse');
+      $('scanBadge').textContent='SUDAH ABSEN';$('scanBadge').className='scan-status-badge badge-ignored';
+      $('scanName').textContent=nama||'Sudah lengkap';
+      $('scanEmpId').textContent=empId;$('scanEmpId').style.display=empId?'block':'none';
+      $('scanTime').style.display='none';$('scanConfRow').style.display='none';
+      log($('scanLog'),'warn','⚠ '+(m.message||'Absensi sudah lengkap'));
+      log($('dashLog'),'warn','⚠ Sudah absen: '+nama);
+    }else if(m.status==='error'){
+      box.className='scan-box error fade-in';
+      $('scanIcon').innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
+      $('scanIcon').classList.remove('pulse');
+      $('scanBadge').textContent='ERROR';$('scanBadge').className='scan-status-badge badge-error';
+      $('scanName').textContent=m.message||'Server error';
+      $('scanEmpId').style.display='none';$('scanTime').style.display='none';$('scanConfRow').style.display='none';
+      log($('scanLog'),'err','✗ API error: '+(m.message||JSON.stringify(m)));
+      log($('dashLog'),'err','✗ API error: '+(m.message||''));
+    }else{
+      log($('scanLog'),'warn','⚠ API response: '+JSON.stringify(m));
     }
   }else if(o.type==='event'){
     const m=o.msg||{};
@@ -364,31 +640,35 @@ function handle(o){
 }
 
 // Enroll
-$('enrollBtn').onclick=async()=>{const name=$('nameInput').value.trim();if(!name){log($('enrollLog'),'warn','isi nama dulu.');return;}clearLog($('enrollLog'));setSteps(-1);const r=await api('/api/enroll','POST',{name});if(!r.ok)log($('enrollLog'),'err','gagal mulai: '+(r.error||''));};
-$('nameInput').addEventListener('keydown',e=>{if(e.key==='Enter')$('enrollBtn').click();});
+$('enrollBtn').onclick=async()=>{const sel=$('employeeSelect');const empId=sel.value;const empName=sel.selectedOptions[0]?.dataset?.nama||'';if(!empId||!empName){log($('enrollLog'),'warn','pilih karyawan dulu.');return;}clearLog($('enrollLog'));setSteps(-1);const r=await api('/api/enroll','POST',{name:empName,employeeId:empId});if(!r.ok)log($('enrollLog'),'err','gagal mulai: '+(r.error||''));};
+$('branchSelect').addEventListener('change',function(){loadEmployees(this.value);});
+$('employeeSelect').addEventListener('change',function(){$('enrollBtn').disabled=!this.value;});
+$('branchRefreshBtn').onclick=()=>loadBranches();
 
 // Scan
-function setScanUI(active){autoActive=active;$('scanOnBtn').disabled=active;$('scanOffBtn').disabled=!active;$('dScan').textContent=active?'AKTIF':'IDLE';$('dScan').style.color=active?'var(--info)':'var(--txt)';if(active){const b=$('scanBox');b.className='scan-box';$('scanName').textContent='Menunggu';$('scanSub').textContent='Letakkan jari di sensor...';$('confWrap').style.display='none';}}
+function setScanUI(active){autoActive=active;$('scanOnBtn').disabled=active;$('scanOffBtn').disabled=!active;$('dScan').textContent=active?'AKTIF':'IDLE';$('dScan').style.color=active?'var(--info)':'var(--txt)';if(active){const b=$('scanBox');b.className='scan-box scanning';$('scanIcon').innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>';$('scanIcon').classList.add('pulse');$('scanBadge').textContent='MENUNGGU JARI';$('scanBadge').className='scan-status-badge badge-scanning';$('scanName').textContent='Tempelkan jari di sensor...';$('scanEmpId').style.display='none';$('scanTime').style.display='none';$('scanConfRow').style.display='none';lastMatch=null;}}
 $('scanOnBtn').onclick=async()=>{clearLog($('scanLog'));const r=await api('/api/autoscan/on','POST');if(r.ok){setScanUI(true);log($('scanLog'),'info','scan aktif. letakkan jari...');log($('dashLog'),'info','scan dimulai');}else log($('scanLog'),'err','gagal mulai: '+(r.error||''));};
 $('scanOffBtn').onclick=async()=>{const r=await api('/api/autoscan/off','POST');setScanUI(false);log($('scanLog'),'muted','scan berhenti.');};
 
 // Data
 async function refreshList(){const[lst,cnt]=await Promise.all([api('/api/list'),api('/api/count')]);const db=lst||{};const ids=Object.keys(db).sort((a,b)=>a-b);$('tCount').textContent=cnt.count!=null?cnt.count:ids.length;$('dataCount').textContent=cnt.count!=null?cnt.count:ids.length;$('iCount').textContent=cnt.count!=null?cnt.count:ids.length;renderTable(db,ids);}
-function renderTable(db,ids){const q=($('searchInput').value||'').toLowerCase();const f=ids.filter(id=>(db[id]||'').toLowerCase().includes(q));const tb=$('tblBody');if(!f.length){tb.innerHTML='<tr><td colspan="3" class="empty">'+(q?'tidak ada yang cocok':'(kosong)')+'</td></tr>';return;}tb.innerHTML='';for(const id of f){const tr=document.createElement('tr');tr.innerHTML='<td class="id">'+id+'</td><td>'+esc(db[id])+'</td>';const td=document.createElement('td');td.className='act';const b=document.createElement('button');b.className='btn btn-dng';b.textContent='Hapus';b.onclick=()=>del(id,db[id]);td.appendChild(b);tr.appendChild(td);tb.appendChild(tr);}}
+function renderTable(db,ids){const q=($('searchInput').value||'').toLowerCase();const f=ids.filter(id=>{const v=db[id];const n=typeof v==='object'?v.name:v;return (n||'').toLowerCase().includes(q);});const tb=$('tblBody');if(!f.length){tb.innerHTML='<tr><td colspan="4" class="empty">'+(q?'tidak ada yang cocok':'(kosong)')+'</td></tr>';return;}tb.innerHTML='';for(const id of f){const entry=db[id];const name=typeof entry==='object'?entry.name:entry;const empId=typeof entry==='object'?entry.employeeId:'';const tr=document.createElement('tr');tr.innerHTML='<td class="id">'+id+'</td><td>'+esc(name)+'</td><td style="color:var(--accent2);font-size:12px">'+esc(empId||'-')+'</td>';const td=document.createElement('td');td.className='act';const b=document.createElement('button');b.className='btn btn-dng';b.textContent='Hapus';b.onclick=()=>del(id,entry);td.appendChild(b);tr.appendChild(td);tb.appendChild(tr);}}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-async function del(id,name){if(!confirm('Hapus ID '+id+' ('+name+')?'))return;const r=await api('/api/delete','POST',{id:parseInt(id,10)});if(r.ok){refreshList();log($('dashLog'),'warn','dihapus: '+name+' (ID '+id+')');}else alert('gagal: '+(r.error||''));}
+async function del(id,entry){const name=typeof entry==='object'?entry.name:entry;if(!confirm('Hapus ID '+id+' ('+name+')?'))return;const r=await api('/api/delete','POST',{id:parseInt(id,10)});if(r.ok){refreshList();log($('dashLog'),'warn','dihapus: '+name+' (ID '+id+')');}else alert('gagal: '+(r.error||''));}
 $('refreshBtn').onclick=refreshList;
 $('searchInput').addEventListener('input',()=>{const db=window._db||{};renderTable(db,Object.keys(db).sort((a,b)=>a-b));});
 $('emptyBtn').onclick=async()=>{if(!confirm('Hapus SEMUA data di sensor?'))return;const r=await api('/api/empty','POST');if(r.ok){refreshList();log($('dashLog'),'warn','semua data dihapus');}else alert('gagal: '+(r.error||''));};
 // cache db for search
 const _origRefresh=refreshList;
-refreshList=async function(){const[lst,cnt]=await Promise.all([api('/api/list'),api('/api/count')]);const db=lst||{};window._db=db;const ids=Object.keys(db).sort((a,b)=>a-b);$('tCount').textContent=cnt.count!=null?cnt.count:ids.length;$('dataCount').textContent=cnt.count!=null?cnt.count:ids.length;$('iCount').textContent=cnt.count!=null?cnt.count:ids.length;renderTable(db,ids);};
+refreshList=async function(){const[lst,cnt]=await Promise.all([api('/api/list'),api('/api/count')]);const db=lst||{};window._db=db;const ids=Object.keys(db).sort((a,b)=>a-b);$('tCount').textContent=cnt.count!=null?cnt.count:ids.length;$('dataCount').textContent=cnt.count!=null?cnt.count:ids.length;$('iCount').textContent=cnt.count!=null?cnt.count:ids.length;renderTable(db,ids);if($('branchSelect').value) loadEmployees($('branchSelect').value);};
 
 // uptime
 setInterval(()=>{if(readyAt){const s=Math.floor((Date.now()-readyAt)/1000);const m=Math.floor(s/60);$('dUptime').textContent=m+'m '+(s%60)+'s';}},1000);
 
 // init
 refreshList();
+loadBranches();
+loadConfigUI();
 api('/api/status').then(s=>{if(s&&s.ready){const i=s.ready;readyData=i;readyAt=Date.now();$('dot').className='dot ok';$('sideStatus').textContent='sensor siap';$('dStat').textContent='SIAP';$('dStat').style.color='var(--ok)';$('tBaud').textContent=i.baud;$('tSec').textContent=i.security;$('iStat').textContent='SIAP';$('iBaud').textContent=i.baud;$('iSec').textContent=i.security;$('iUart').textContent=i.uart||'-';}else{$('dot').className='dot bad';$('sideStatus').textContent='bridge belum siap';$('dStat').textContent='OFFLINE';$('dStat').style.color='var(--err)';}}).catch(()=>{$('dot').className='dot bad';$('sideStatus').textContent='bridge belum siap';$('dStat').textContent='OFFLINE';$('dStat').style.color='var(--err)';});
 </script>
 </body>

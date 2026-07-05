@@ -1,0 +1,156 @@
+================================================================================
+  FORMAT RESPONSE API — POST /api/finger/arduino/attendance
+  (untuk developer API server)
+================================================================================
+
+Arduino bridge mengirim POST ke endpoint ini setiap kali sensor mendeteksi
+sidik jari yang cocok (on-sensor matching via fingerSearch).
+
+
+1. REQUEST (dikirim bridge)
+
+  POST /api/finger/arduino/attendance
+  Content-Type: application/json
+
+  Body:
+  {
+    "employeeId": "CKS-MI-0001",
+    "device_id":  "arduino-001",
+    "kode_cabang": "CKS"
+  }
+
+
+2. RESPONSE YANG DIHARAPKAN BRIDGE
+
+Bridge mengharapkan response JSON dengan field-field berikut.
+Gunakan format persis seperti di bawah agar UI menampilkan data dengan benar.
+
+----------------------------------------------------------------
+2a. CHECKIN (fingerprint pertama hari ini)
+----------------------------------------------------------------
+
+  {
+    "status":     "checkin",
+    "type":       "masuk",
+    "employeeId": "CKS-MI-0001",
+    "name":       "Ahmad Fauzi",
+    "nama":       "Ahmad Fauzi",
+    "time":       "07:45:00",
+    "message":    "Absen masuk berhasil"
+  }
+
+  Catatan:
+  - "name" dan "nama" isi dengan nama karyawan yang sama (UI fallback pakai
+    name dulu, lalu nama)
+  - "employeeId" WAJIB ada (UI pakai untuk label di scan box)
+  - "time" WAJIB ada format HH:MM:SS (UI tampilkan di log dan scan box)
+  - Tanpa field di atas -> UI akan tampil "undefined"
+
+
+----------------------------------------------------------------
+2b. CHECKOUT (fingerprint kedua hari ini)
+----------------------------------------------------------------
+
+  {
+    "status":     "checkout",
+    "type":       "pulang",
+    "employeeId": "CKS-MI-0001",
+    "name":       "Ahmad Fauzi",
+    "nama":       "Ahmad Fauzi",
+    "time":       "17:05:00",
+    "message":    "Absen pulang berhasil"
+  }
+
+
+----------------------------------------------------------------
+2c. IGNORED (sudah 2x absen hari ini)
+----------------------------------------------------------------
+
+  {
+    "status":     "ignored",
+    "type":       "already_complete",
+    "employeeId": "CKS-MI-0001",
+    "name":       "Ahmad Fauzi",
+    "nama":       "Ahmad Fauzi",
+    "message":    "Absensi hari ini sudah lengkap (masuk & pulang)"
+  }
+
+  Catatan:
+  - time tidak diperlukan (tidak ada aksi baru)
+  - name/nama/employeeId tetap dikirim agar UI bisa menampilkan siapa
+
+
+----------------------------------------------------------------
+2d. NOT_FOUND (sidik jari tidak dikenal / employeeId tidak ada)
+----------------------------------------------------------------
+
+  {
+    "status":  "not_found",
+    "message": "Sidik jari tidak dikenal"
+  }
+
+
+----------------------------------------------------------------
+2e. ERROR (server error)
+----------------------------------------------------------------
+
+  {
+    "status":  "error",
+    "message": "Internal server error"
+  }
+
+
+3. FIELD REFERENCE
+
+  Field        | Tipe    | Wajib | Keterangan
+  -------------|---------|-------|------------------------------------------
+  status       | string  | YA    | "checkin" | "checkout" | "ignored" | "not_found" | "error"
+  type         | string  | tidak | "masuk" | "pulang" | "already_complete"
+  employeeId   | string  | YA*    | ID karyawan (id_biodata). Wajib untuk checkin/checkout/ignored
+  name         | string  | YA*    | Nama karyawan. Wajib untuk checkin/checkout/ignored
+  nama         | string  | YA*    | Fallback nama (same as name). Wajib untuk checkin/checkout/ignored
+  time         | string  | YA*    | Waktu HH:MM:SS. Wajib untuk checkin/checkout
+  message      | string  | YA    | Pesan deskriptif untuk log
+  * = wajib untuk status checkin/checkout/ignored
+
+
+4. PENYEBAB OUTPUT "undefined" DI LOG
+
+  Log saat ini:
+    20:14:16  ✓ CHECKIN    undefined
+
+  Template log di UI:
+    "✓ CHECKIN  {name} ({employeeId})  {time}"
+
+  Karena API mengembalikan response TANPA field name, employeeId, dan time,
+  maka semua field tersebut menjadi undefined. Inilah penyebab output
+  "undefined" di atas.
+
+  Minimal response yang harus dikirim agar output benar:
+  {
+    "status":     "checkin",
+    "name":       "Ahmad Fauzi",
+    "employeeId": "CKS-MI-0001",
+    "time":       "20:14:16",
+    "message":    "Absen masuk berhasil"
+  }
+
+  Akan menghasilkan log:
+    20:14:16  ✓ CHECKIN  Ahmad Fauzi (CKS-MI-0001)  20:14:16
+
+
+5. SERVER LOGIC (rekomendasi)
+
+  Server menerima employeeId -> cari di tabel personal:
+
+  1. SELECT * FROM personal WHERE id_biodata = ?
+  2. Jika tidak ditemukan:
+     -> return { status: "not_found", message: "..." }
+  3. Jika ditemukan:
+     -> Cek blk_absensi hari ini untuk id_biodata tersebut
+     -> Jika belum ada record:
+        INSERT jam_masuk -> return { status: "checkin", ... }
+     -> Jika sudah ada 1 record, jam_pulang NULL:
+        UPDATE jam_pulang -> return { status: "checkout", ... }
+     -> Jika sudah lengkap:
+        return { status: "ignored", ... }

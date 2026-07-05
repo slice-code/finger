@@ -1,8 +1,14 @@
 {
-  "1": "liz",
-  "2": "uno",
-  "3": "blinc",
-  "4": "bob",
-  "5": "lena",
-  "6": "udo"
+  "1": {
+    "name": "Ahmad Fauzi",
+    "employeeId": "CKS-MI-0001"
+  },
+  "2": {
+    "name": "Ani Rahayu",
+    "employeeId": "CKS-FF-0003"
+  },
+  "3": {
+    "name": "Budi Santoso",
+    "employeeId": "CKS-MF-0001"
+  }
 }

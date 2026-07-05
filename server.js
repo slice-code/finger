@@ -10,6 +10,22 @@ const PORT = process.env.PORT || '/dev/ttyUSB0';
 const BAUD = parseInt(process.env.BAUD || '9600', 10);
 const HTTP_PORT = parseInt(process.env.HTTP_PORT || '3000', 10);
 const DB_PATH = path.join(__dirname, 'fingerprints.json');
+const CONFIG_PATH = path.join(__dirname, 'config.json');
+
+function loadConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); }
+  catch { return { apiBaseUrl: 'http://192.168.1.15:3004' }; }
+}
+function saveConfigFile(cfg) {
+  const c = loadConfig();
+  Object.assign(c, cfg);
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 2));
+  config = c;
+  API_BASE = c.apiBaseUrl || 'http://192.168.1.15:3004';
+}
+
+let config = loadConfig();
+let API_BASE = config.apiBaseUrl || 'http://192.168.1.15:3004';
 
 // ---------- DB ----------
 function loadDB() {
@@ -55,7 +71,17 @@ function handleLine(raw) {
   if (msg.event === 'match' || msg.event === 'nomatch' || msg.event === 'autoscan_err') {
     if (msg.event === 'match') {
       const db = loadDB();
-      msg.name = db[String(msg.id)] || '(tidak dikenal)';
+      const entry = db[String(msg.id)];
+      msg.name = typeof entry === 'object' ? (entry.name || '(tidak dikenal)') : (entry || '(tidak dikenal)');
+      msg.employeeId = typeof entry === 'object' ? (entry.employeeId || null) : null;
+
+      if (msg.employeeId && config.kode_cabang) {
+        apiPost('/api/finger/arduino/attendance', {
+          employeeId: msg.employeeId,
+          device_id: config.device_id || 'arduino-001',
+          kode_cabang: config.kode_cabang,
+        });
+      }
     }
     broadcast({ type: 'scan', msg });
     return;
@@ -68,9 +94,9 @@ function handleLine(raw) {
   // event enrol & lainnya
   if (msg.event === 'enrolled' && pendingEnroll) {
     const db = loadDB();
-    db[String(msg.id)] = pendingEnroll.name;
+    db[String(msg.id)] = { name: pendingEnroll.name, employeeId: pendingEnroll.employeeId || null };
     saveDB(db);
-    broadcast({ type: 'enroll_done', id: msg.id, name: pendingEnroll.name });
+    broadcast({ type: 'enroll_done', id: msg.id, name: pendingEnroll.name, employeeId: pendingEnroll.employeeId || null });
     pendingEnroll = null;
     enrollActive = false;
     return;
@@ -131,6 +157,57 @@ function sendJSON(res, obj, status = 200) {
   res.end(JSON.stringify(obj));
 }
 
+function apiProxy(path, res) {
+  const url = new URL(path, API_BASE);
+  http.get(url.toString(), (proxyRes) => {
+    let data = '';
+    proxyRes.on('data', (c) => data += c);
+    proxyRes.on('end', () => {
+      try {
+        const json = JSON.parse(data);
+        sendJSON(res, json);
+      } catch { sendJSON(res, { success: false, error: 'invalid_response' }, 502); }
+    });
+  }).on('error', (err) => sendJSON(res, { success: false, error: err.message }, 502));
+}
+
+function apiPost(path, body, res) {
+  const postData = JSON.stringify(body);
+  const url = new URL(path, API_BASE);
+  const options = {
+    hostname: url.hostname,
+    port: url.port,
+    path: url.pathname + url.search,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(postData),
+    },
+  };
+  const req = http.request(options, (proxyRes) => {
+    let data = '';
+    proxyRes.on('data', (c) => data += c);
+    proxyRes.on('end', () => {
+      try {
+        const json = JSON.parse(data);
+        if (res) sendJSON(res, json);
+        else broadcast({ type: 'attendance', msg: json });
+      } catch {
+        const err = { status: 'error', message: 'invalid_response' };
+        if (res) sendJSON(res, err, 502);
+        else broadcast({ type: 'attendance', msg: err });
+      }
+    });
+  });
+  req.on('error', (err) => {
+    const errMsg = { status: 'error', message: err.message };
+    if (res) sendJSON(res, errMsg, 502);
+    else broadcast({ type: 'attendance', msg: errMsg });
+  });
+  req.write(postData);
+  req.end();
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const p = url.pathname;
@@ -162,14 +239,15 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && p === '/api/enroll') {
     const body = await readBody(req);
     const name = (body.name || '').trim();
+    const employeeId = body.employeeId || null;
     if (!name) return sendJSON(res, { ok: false, error: 'name_empty' }, 400);
     if (enrollActive) return sendJSON(res, { ok: false, error: 'enroll_busy' }, 409);
     try {
       const c = await sendCmd('COUNT');
       const id = (c.count || 0) + 1;
       enrollActive = true;
-      pendingEnroll = { id, name };
-      broadcast({ type: 'enroll_start', id, name });
+      pendingEnroll = { id, name, employeeId };
+      broadcast({ type: 'enroll_start', id, name, employeeId });
       send('ENROLL ' + id).catch(() => {});
       // enroll selesai dideteksi via event 'enrolled' / 'err' / 'already_registered' di handleLine
       return sendJSON(res, { ok: true, id, name });
@@ -194,6 +272,22 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && p === '/api/empty') {
     try { const r = await sendCmd('EMPTY'); if (r.ok) saveDB({}); return sendJSON(res, r); }
     catch (e) { return sendJSON(res, { ok: false, error: e.message }, 500); }
+  }
+  if (req.method === 'GET' && p === '/api/branches') {
+    return apiProxy('/api/finger/branches', res);
+  }
+  if (req.method === 'GET' && p === '/api/employees') {
+    const kodeCabang = url.searchParams.get('kode_cabang') || '';
+    const query = kodeCabang ? `?kode_cabang=${encodeURIComponent(kodeCabang)}` : '';
+    return apiProxy(`/api/finger/employees${query}`, res);
+  }
+  if (req.method === 'GET' && p === '/api/config') {
+    return sendJSON(res, loadConfig());
+  }
+  if (req.method === 'POST' && p === '/api/config') {
+    const body = await readBody(req);
+    saveConfigFile(body);
+    return sendJSON(res, { ok: true });
   }
   sendJSON(res, { ok: false, error: 'not_found' }, 404);
 });
