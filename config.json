@@ -1,5 +1,6 @@
 {
   "apiBaseUrl": "http://localhost:3004",
   "device_id": "arduino-001",
-  "kode_cabang": "CKS"
+  "kode_cabang": "CKS",
+  "https_port": 443
 }

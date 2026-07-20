@@ -9,6 +9,7 @@
     "fpm": "./cli.js"
   },
   "scripts": {
+    "postinstall": "electron-rebuild -f -w serialport",
     "electron": "electron .",
     "electron:nosandbox": "electron . --no-sandbox",
     "web": "node server.js",

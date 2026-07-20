@@ -2,6 +2,7 @@
 'use strict';
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const { SerialPort } = require('serialport');
@@ -9,6 +10,9 @@ const { SerialPort } = require('serialport');
 const PORT = process.env.PORT || '/dev/ttyUSB0';
 const BAUD = parseInt(process.env.BAUD || '9600', 10);
 const HTTP_PORT = parseInt(process.env.HTTP_PORT || '3000', 10);
+const HTTPS_PORT = parseInt(process.env.HTTPS_PORT || '443', 10);
+const CERT_PATH = path.join(__dirname, 'certs', 'cert.pem');
+const KEY_PATH = path.join(__dirname, 'certs', 'key.pem');
 const DB_PATH = path.join(__dirname, 'fingerprints.json');
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 
@@ -101,10 +105,13 @@ function handleLine(raw) {
       msg.employeeId = typeof entry === 'object' ? (entry.employeeId || null) : null;
 
       if (msg.employeeId && config.kode_cabang) {
+        const now = new Date();
+        const time = now.toTimeString().slice(0, 8);
         apiPost('/api/finger/arduino/attendance', {
           employeeId: msg.employeeId,
           device_id: config.device_id || 'arduino-001',
           kode_cabang: config.kode_cabang,
+          time,
         });
       }
     }
@@ -182,9 +189,15 @@ function sendJSON(res, obj, status = 200) {
   res.end(JSON.stringify(obj));
 }
 
+function httpModule(urlStr) {
+  return urlStr.startsWith('https') ? https : http;
+}
+
 function apiProxy(path, res) {
   const url = new URL(path, API_BASE);
-  http.get(url.toString(), (proxyRes) => {
+  const mod = httpModule(url.protocol);
+  const opts = { rejectUnauthorized: false };
+  mod.get(url.toString(), opts, (proxyRes) => {
     let data = '';
     proxyRes.on('data', (c) => data += c);
     proxyRes.on('end', () => {
@@ -199,17 +212,19 @@ function apiProxy(path, res) {
 function apiPost(path, body, res) {
   const postData = JSON.stringify(body);
   const url = new URL(path, API_BASE);
+  const mod = httpModule(url.protocol);
   const options = {
     hostname: url.hostname,
     port: url.port,
     path: url.pathname + url.search,
     method: 'POST',
+    rejectUnauthorized: false,
     headers: {
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(postData),
     },
   };
-  const req = http.request(options, (proxyRes) => {
+  const req = mod.request(options, (proxyRes) => {
     let data = '';
     proxyRes.on('data', (c) => data += c);
     proxyRes.on('end', () => {
@@ -336,3 +351,17 @@ server.listen(HTTP_PORT, async () => {
     console.error('Gagal buka serial:', e.message);
   }
 });
+
+if (fs.existsSync(CERT_PATH) && fs.existsSync(KEY_PATH)) {
+  const sslOptions = {
+    cert: fs.readFileSync(CERT_PATH),
+    key: fs.readFileSync(KEY_PATH),
+  };
+  https.createServer(sslOptions, async (req, res) => {
+    server.emit('request', req, res);
+  }).listen(HTTPS_PORT, () => {
+    console.log(`Web GUI (HTTPS): https://localhost:${HTTPS_PORT}`);
+  });
+} else {
+  console.warn('SSL cert/key tidak ditemukan, HTTPS dinonaktifkan. Jalankan: openssl req -x509 -newkey rsa:2048 -keyout certs/key.pem -out certs/cert.pem -days 365 -nodes -subj "/CN=localhost"');
+}

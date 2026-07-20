@@ -4,6 +4,7 @@ const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
+const https = require('https');
 const { SerialPort } = require('serialport');
 
 const PORT = process.env.PORT || '/dev/ttyUSB0';
@@ -88,10 +89,13 @@ function handleLine(raw) {
       msg.employeeId = typeof entry === 'object' ? (entry.employeeId || null) : null;
 
       if (msg.employeeId && config.kode_cabang) {
+        const now = new Date();
+        const time = now.toTimeString().slice(0, 8);
         apiPost('/api/finger/arduino/attendance', {
           employeeId: msg.employeeId,
           device_id: config.device_id || 'arduino-001',
           kode_cabang: config.kode_cabang,
+          time,
         }).then(apiRes => {
           broadcast('bridge-event', { type: 'attendance', msg: apiRes });
         }).catch(err => {
@@ -150,10 +154,16 @@ function sendCmd(cmd, timeoutMs = 10000) {
   });
 }
 
+function httpModule(urlStr) {
+  return urlStr.startsWith('https') ? https : http;
+}
+
 function apiGet(path) {
   return new Promise((resolve, reject) => {
     const url = new URL(path, API_BASE);
-    http.get(url.toString(), (res) => {
+    const mod = httpModule(url.protocol);
+    const opts = { rejectUnauthorized: false };
+    mod.get(url.toString(), opts, (res) => {
       let data = '';
       res.on('data', (c) => data += c);
       res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(data); } });
@@ -165,17 +175,19 @@ function apiPost(path, body) {
   return new Promise((resolve, reject) => {
     const postData = JSON.stringify(body);
     const url = new URL(path, API_BASE);
+    const mod = httpModule(url.protocol);
     const options = {
       hostname: url.hostname,
       port: url.port,
       path: url.pathname + url.search,
       method: 'POST',
+      rejectUnauthorized: false,
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(postData),
       },
     };
-    const req = http.request(options, (res) => {
+    const req = mod.request(options, (res) => {
       let data = '';
       res.on('data', (c) => data += c);
       res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(data); } });
@@ -261,6 +273,11 @@ ipcMain.handle('api:reconnect', async () => {
 });
 
 // ---------- Window ----------
+app.on('certificate-error', (event, _webContents, _url, _error, _certificate, callback) => {
+  event.preventDefault();
+  callback(true);
+});
+
 function createWindow() {
   const w = new BrowserWindow({
     width: 1180,
