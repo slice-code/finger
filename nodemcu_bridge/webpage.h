@@ -73,7 +73,6 @@ td{padding:8px;border-bottom:1px solid var(--border)}
 <div class="tabs">
   <div class="tab on" onclick="go('dash')">Dashboard</div>
   <div class="tab" onclick="go('enroll')">Daftar</div>
-  <div class="tab" onclick="go('scan')">Scan</div>
   <div class="tab" onclick="go('data')">Data</div>
   <div class="tab" onclick="go('wifi')">WiFi</div>
   <div class="tab" onclick="go('setel')">Setelan</div>
@@ -94,7 +93,6 @@ td{padding:8px;border-bottom:1px solid var(--border)}
   </div>
   <div class="card"><h3>Quick Actions</h3>
     <button class="btn btn-c" onclick="go('enroll')">Daftar Sidik Jari Baru</button>
-    <button class="btn btn-g" onclick="go('scan')">Mulai Scan</button>
   </div>
   <div class="card"><h3>Activity Log</h3><div class="log" id="elog"></div></div>
 </div>
@@ -116,13 +114,12 @@ td{padding:8px;border-bottom:1px solid var(--border)}
 
 <div class="page" id="p-scan">
   <div class="card">
-    <div class="scan-box" id="sbox">
+    <div class="scan-box active" id="sbox">
       <div class="scan-icon" id="sicon">&#x1f463;</div>
-      <div class="scan-badge badge-idle" id="sbadge">IDLE</div>
-      <div class="scan-name" id="sname">Tekan tombol untuk mulai</div>
+      <div class="scan-badge badge-scan" id="sbadge">SCANNING</div>
+      <div class="scan-name" id="sname">Menempelkan jari...</div>
       <div style="font-size:12px;color:var(--dim)" id="sconf"></div>
     </div>
-    <button class="btn btn-g" id="scanBtn" onclick="toggleScan()">Mulai Scan</button>
   </div>
   <div class="card"><h3>Scan Log</h3><div class="log" id="slog"></div></div>
 </div>
@@ -146,15 +143,18 @@ td{padding:8px;border-bottom:1px solid var(--border)}
       <div style="flex:1"><div style="font-size:14px;color:var(--dim)" id="wsta">-</div><div style="font-size:12px;color:var(--dim)">Connected</div></div>
     </div>
   </div>
+  <div class="card"><h3>Jaringan Tersimpan</h3>
+    <div id="wsaved"></div>
+    <button class="btn btn-r" id="wresetBtn" onclick="resetWifi()" style="display:none;margin-top:8px">Hapus Semua & Reboot</button>
+  </div>
   <div class="card"><h3>Scan Network</h3>
     <button class="btn btn-o" onclick="scanWifi()">Scan</button>
     <div id="wlist" style="margin-top:8px"></div>
   </div>
-  <div class="card"><h3>Connect to WiFi</h3>
-    <label>SSID</label><input id="wssid" placeholder="Network name" readonly>
+  <div class="card"><h3>Tambah Jaringan Baru</h3>
+    <label>SSID</label><input id="wssid" placeholder="Pilih dari scan di atas" readonly>
     <label>Password</label><input id="wpass" type="password" placeholder="Password">
     <button class="btn btn-c" onclick="saveWifi()">Simpan & Reboot</button>
-    <button class="btn btn-r" id="wresetBtn" onclick="resetWifi()" style="display:none">Hapus WiFi & Reboot</button>
   </div>
 </div>
 
@@ -175,10 +175,10 @@ td{padding:8px;border-bottom:1px solid var(--border)}
 </div>
 
 <script>
-var autoOn=false,scanRunning=false;
+var autoOn=false;
 function go(s){document.querySelectorAll('.page').forEach(p=>p.classList.remove('on'));
 document.getElementById('p-'+s).classList.add('on');
-document.querySelectorAll('.tab').forEach((t,i)=>{t.classList.toggle('on',['dash','enroll','scan','data','wifi','setel'][i]===s)});
+document.querySelectorAll('.tab').forEach((t,i)=>{t.classList.toggle('on',['dash','enroll','data','wifi','setel'][i]===s)});
 if(s==='data')loadData();if(s==='wifi')loadWifiStatus();if(s==='setel')loadSettings();if(s==='enroll')loadBranchList()}
 function addLog(el,cls,txt){var d=document.getElementById(el);var m=document.createElement('div');
 m.innerHTML='<span class="t">'+new Date().toLocaleTimeString()+'</span> <span class="'+cls+'">'+txt+'</span>';
@@ -192,7 +192,7 @@ document.getElementById('sdot').className='dot '+(d.ready?'dot-g':'dot-r');
 document.getElementById('stxt').textContent=d.ready?(d.autoActive?'SCANNING':'SIAP'):'OFFLINE';
 document.getElementById('tpill').textContent=d.count+' templates';
 document.getElementById('dcnt').textContent=d.count;
-document.getElementById('dscan').textContent=d.autoActive?'ACTIVE':'IDLE';
+document.getElementById('dscan').textContent=d.autoActive?'ACTIVE':'ENROLL';
 document.getElementById('dscan').className='stat '+(d.autoActive?'stat-g':'stat-r');
 document.getElementById('dwmode').textContent=d.wifiMode;
 document.getElementById('dwmode').style.color=d.wifiMode==='STA'?'var(--green)':'var(--yellow)';
@@ -200,7 +200,7 @@ document.getElementById('dwip').textContent=d.wifiMode==='STA'?d.staIP:'192.168.
 var e=document.getElementById('sfg-wmode');if(e)e.textContent=d.wifiMode;
 var e=document.getElementById('sfg-ip');if(e)e.textContent=d.wifiMode==='STA'?d.staIP:'192.168.4.1';
 var e=document.getElementById('sfg-fp');if(e)e.textContent=d.count+' templates | baud:'+d.baud;
-autoOn=d.autoOn;if(d.autoActive)go('scan');
+autoOn=d.autoOn;
 }).catch(()=>{})}
 
 function startEnroll(){
@@ -262,16 +262,6 @@ if(!cnt)sel.innerHTML='<option value="">-- Semua sudah terdaftar --</option>';
 sel.innerHTML='<option value="">-- Gagal memuat --</option>';
 })}
 
-function toggleScan(){
-if(!scanRunning){api('/api/autoscan/on','POST').then(d=>{if(d.ok){scanRunning=true;
-document.getElementById('scanBtn').textContent='Stop Scan';
-document.getElementById('scanBtn').className='btn btn-r';
-setScanState('active','MENUNGGU','Menempelkan jari...')}})}
-else{api('/api/autoscan/off','POST').then(()=>{scanRunning=false;
-document.getElementById('scanBtn').textContent='Mulai Scan';
-document.getElementById('scanBtn').className='btn btn-g';
-setScanState('','IDLE','Tekan tombol untuk mulai')})}}
-
 function setScanState(cls,badge,name){
 var b=document.getElementById('sbox');b.className='scan-box '+(cls||'');
 document.getElementById('sbadge').className='scan-badge badge-'+(cls==='ok'?'ok':cls==='fail'?'fail':cls==='active'?'scan':'idle');
@@ -305,7 +295,15 @@ api('/api/wifi').then(d=>{
 document.getElementById('wmode').textContent=d.mode;
 document.getElementById('wmode').style.color=d.mode==='STA'?'var(--green)':'var(--yellow)';
 document.getElementById('wsta').textContent=d.connected?d.staSSID+' ('+d.staIP+')':'Tidak terhubung';
-document.getElementById('wresetBtn').style.display=d.hasSaved?'block':'none';
+document.getElementById('wresetBtn').style.display=d.savedCount>0?'block':'none';
+var h='';
+if(d.saved&&d.saved.length){d.saved.forEach(function(n,i){
+h+='<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-bottom:4px">';
+h+='<span style="font-weight:600;font-size:14px">'+n.ssid+'</span>';
+if(d.connected&&d.staSSID===n.ssid)h+='<span style="color:var(--green);font-size:11px">TERSAMBUNG</span>';
+h+='<button class="del-btn" onclick="deleteWifi(\''+n.ssid.replace(/'/g,"\\'")+'\')">&times;</button></div>';
+});}else{h='<div style="text-align:center;padding:12px;color:var(--dim)">Belum ada jaringan tersimpan</div>';}
+document.getElementById('wsaved').innerHTML=h;
 }).catch(()=>{})}
 
 function scanWifi(){
@@ -337,6 +335,12 @@ if(!confirm('Simpan WiFi "'+ssid+'" dan reboot?'))return;
 api('/api/wifi','POST',{ssid:ssid,pass:pass}).then(d=>{
 if(d.ok){alert('Tersimpan! Device akan reboot...');}
 }).catch(()=>alert('Gagal menyimpan'))}
+
+function deleteWifi(ssid){
+if(!confirm('Hapus "'+ssid+'" dari daftar?'))return;
+api('/api/wifi/delete','POST',{ssid:ssid}).then(d=>{
+if(d.ok){loadWifiStatus();}
+}).catch(()=>alert('Gagal menghapus'))}
 
 function resetWifi(){
 if(!confirm('Hapus WiFi credentials dan reboot ke AP mode?'))return;
@@ -404,14 +408,6 @@ addLog('slog','ok','MATCH: '+(o.name||'?')+' ID:'+o.id)}
 else if(t==='nomatch'){
 setScanState('fail','TIDAK DIKENALI','Sidik jari tidak terdaftar');
 addLog('slog','er','No match (code:'+o.code+')')}
-else if(t==='autoscan_on'){
-scanRunning=true;setScanState('active','MENUNGGU','Menempelkan jari...');
-document.getElementById('scanBtn').textContent='Stop Scan';
-document.getElementById('scanBtn').className='btn btn-r'}
-else if(t==='autoscan_off'){
-scanRunning=false;setScanState('','IDLE','Tekan tombol untuk mulai');
-document.getElementById('scanBtn').textContent='Mulai Scan';
-document.getElementById('scanBtn').className='btn btn-g'}
 else if(t==='autoscan_err')
 addLog('slog','er','Scan error: '+(o.step||'')+' code:'+(o.code||''));
 else if(t==='attendance'){

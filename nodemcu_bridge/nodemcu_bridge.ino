@@ -55,9 +55,10 @@ char rxBuf[80];
 uint8_t rxLen = 0;
 
 // ── WiFi credentials ──────────────────────────────────────────────
+#define MAX_SAVED_WIFI 5
 struct WiFiCreds { char ssid[33]; char pass[65]; };
-WiFiCreds savedWiFi;
-bool hasSavedWiFi = false;
+WiFiCreds savedWiFi[MAX_SAVED_WIFI];
+int savedWiFiCount = 0;
 
 // ── Backend API Settings ──────────────────────────────────────────
 #define SETTINGS_FILENAME "/settings.json"
@@ -226,7 +227,7 @@ void lcdShowIdle() {
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(COL_DIM, COL_BG);
   tft.setTextSize(1);
-  tft.drawString("Place finger on sensor", SCREEN_W / 2, STATUS_Y);
+  tft.drawString(autoScan ? "Scan mode - touch sensor" : "Place finger on sensor", SCREEN_W / 2, STATUS_Y);
   lcdDrawFooter();
 }
 
@@ -537,32 +538,66 @@ void handleSSE() {
 //  WiFi Manager - Load/Save credentials
 // ────────────────────────────────────────────────────────────────────
 void wifiLoadCreds() {
-  hasSavedWiFi = false;
+  savedWiFiCount = 0;
   File f = LittleFS.open(WIFI_FILENAME, "r");
   if (!f) return;
-  DynamicJsonDocument doc(256);
+  DynamicJsonDocument doc(1024);
   if (deserializeJson(doc, f)) { f.close(); return; }
   f.close();
-  const char *s = doc["ssid"] | "";
-  const char *p = doc["pass"] | "";
-  if (s[0]) {
-    strncpy(savedWiFi.ssid, s, 32);
-    strncpy(savedWiFi.pass, p, 64);
-    hasSavedWiFi = true;
+  JsonArray arr = doc.as<JsonArray>();
+  for (JsonObject obj : arr) {
+    if (savedWiFiCount >= MAX_SAVED_WIFI) break;
+    const char *s = obj["ssid"] | "";
+    const char *p = obj["pass"] | "";
+    if (s[0]) {
+      strncpy(savedWiFi[savedWiFiCount].ssid, s, 32);
+      strncpy(savedWiFi[savedWiFiCount].pass, p, 64);
+      savedWiFiCount++;
+    }
   }
 }
 
-void wifiSaveCreds(const char *ssid, const char *pass) {
-  DynamicJsonDocument doc(256);
-  doc["ssid"] = ssid;
-  doc["pass"] = pass;
+void wifiSaveCreds() {
+  DynamicJsonDocument doc(1024);
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < savedWiFiCount; i++) {
+    JsonObject obj = arr.createNestedObject();
+    obj["ssid"] = savedWiFi[i].ssid;
+    obj["pass"] = savedWiFi[i].pass;
+  }
   File f = LittleFS.open(WIFI_FILENAME, "w");
   if (f) { serializeJson(doc, f); f.close(); }
 }
 
+void wifiAddCreds(const char *ssid, const char *pass) {
+  if (savedWiFiCount >= MAX_SAVED_WIFI) return;
+  for (int i = 0; i < savedWiFiCount; i++) {
+    if (strcmp(savedWiFi[i].ssid, ssid) == 0) {
+      strncpy(savedWiFi[i].pass, pass, 64);
+      wifiSaveCreds();
+      return;
+    }
+  }
+  strncpy(savedWiFi[savedWiFiCount].ssid, ssid, 32);
+  strncpy(savedWiFi[savedWiFiCount].pass, pass, 64);
+  savedWiFiCount++;
+  wifiSaveCreds();
+}
+
+void wifiRemoveCreds(const char *ssid) {
+  for (int i = 0; i < savedWiFiCount; i++) {
+    if (strcmp(savedWiFi[i].ssid, ssid) == 0) {
+      for (int j = i; j < savedWiFiCount - 1; j++) savedWiFi[j] = savedWiFi[j + 1];
+      savedWiFiCount--;
+      wifiSaveCreds();
+      return;
+    }
+  }
+}
+
 void wifiClearCreds() {
+  savedWiFiCount = 0;
   LittleFS.remove(WIFI_FILENAME);
-  hasSavedWiFi = false;
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -644,10 +679,16 @@ void wifiInit() {
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.printf("[WiFi] AP: %s | AP IP: 192.168.4.1\n", AP_SSID);
 
-  if (hasSavedWiFi) {
-    Serial.printf("[WiFi] Trying saved: %s\n", savedWiFi.ssid);
-    WiFi.begin(savedWiFi.ssid, savedWiFi.pass);
+  if (savedWiFiCount == 0) {
+    Serial.println("[WiFi] No saved credentials, AP only");
+    return;
+  }
+
+  for (int i = 0; i < savedWiFiCount; i++) {
+    Serial.printf("[WiFi] Trying saved: %s\n", savedWiFi[i].ssid);
+    WiFi.begin(savedWiFi[i].ssid, savedWiFi[i].pass);
 
     unsigned long start = millis();
     while (millis() - start < WIFI_TIMEOUT_MS) {
@@ -658,17 +699,14 @@ void wifiInit() {
     if (WiFi.status() == WL_CONNECTED) {
       wifiConnected = true;
       staIP = WiFi.localIP().toString();
-      staSSID = String(savedWiFi.ssid);
-      Serial.printf("[WiFi] Connected to %s | IP: %s\n", savedWiFi.ssid, staIP.c_str());
-    } else {
-      Serial.println("[WiFi] STA failed, AP still active");
-      WiFi.disconnect();
+      staSSID = String(savedWiFi[i].ssid);
+      Serial.printf("[WiFi] Connected to %s | IP: %s\n", savedWiFi[i].ssid, staIP.c_str());
+      return;
     }
-  } else {
-    Serial.println("[WiFi] No saved credentials, AP only");
+    WiFi.disconnect();
   }
 
-  Serial.printf("[WiFi] AP: %s | AP IP: 192.168.4.1\n", AP_SSID);
+  Serial.println("[WiFi] All saved networks failed, AP only");
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -682,12 +720,12 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
   lcdShowEnrollTitle(id);
   lcdEnrollStep("Remove finger", -1, "Clear sensor first", COL_TEXT);
   emit(F("{\"event\":\"enroll_start\",\"id\":%d}"), id);
-  if (!waitNoFinger()) { lcdEnrollErr("TIMEOUT"); emit(F("{\"event\":\"enroll_fail\",\"code\":-1}")); enrollActive = false; return 0xFE; }
+  if (!waitNoFinger()) { lcdEnrollErr("TIMEOUT"); emit(F("{\"event\":\"enroll_fail\",\"code\":-1}")); autoScan = true; lcdShowIdle(); enrollActive = false; return 0xFE; }
 
   for (int attempt = 0; attempt < 3; attempt++) {
     lcdEnrollStep("Place finger", 10, "Touch sensor gently", COL_WARN);
     emit(F("{\"event\":\"waiting_finger\"}"));
-    if (!waitFinger()) { lcdEnrollErr("TIMEOUT"); emit(F("{\"event\":\"enroll_fail\",\"code\":-1}")); enrollActive = false; return 0xFE; }
+    if (!waitFinger()) { lcdEnrollErr("TIMEOUT"); emit(F("{\"event\":\"enroll_fail\",\"code\":-1}")); autoScan = true; lcdShowIdle(); enrollActive = false; return 0xFE; }
 
     lcdEnrollStep("Capturing...", 25, "Reading fingerprint", COL_CYAN);
     flushRX(); delay(200);
@@ -695,7 +733,7 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
     if (p != FINGERPRINT_OK) {
       lcdEnrollErr("Bad Image #1");
       emit(F("{\"event\":\"bad_image\",\"step\":1,\"code\":%d}"), p);
-      if (!waitNoFinger()) { lcdEnrollErr("TIMEOUT"); enrollActive = false; return 0xFE; }
+      if (!waitNoFinger()) { lcdEnrollErr("TIMEOUT"); autoScan = true; lcdShowIdle(); enrollActive = false; return 0xFE; }
       continue;
     }
     lcdEnrollStep("Step 1 OK", 40, "First scan captured", COL_OK);
@@ -708,17 +746,19 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
       lcdEnrollErr(msg);
       emit(F("{\"event\":\"already_registered\",\"id\":%d}"), finger.fingerID);
       waitNoFinger();
+      autoScan = true;
+      lcdShowIdle();
       enrollActive = false;
       return 0xFF;
     }
 
     lcdEnrollStep("Remove finger", 50, "Lift finger off sensor", COL_TEXT);
     emit(F("{\"event\":\"remove\"}"));
-    if (!waitNoFinger()) { lcdEnrollErr("TIMEOUT"); enrollActive = false; return 0xFE; }
+    if (!waitNoFinger()) { lcdEnrollErr("TIMEOUT"); autoScan = true; lcdShowIdle(); enrollActive = false; return 0xFE; }
 
     lcdEnrollStep("Place again", 60, "Same finger, same spot", COL_WARN);
     emit(F("{\"event\":\"waiting_finger_2\"}"));
-    if (!waitFinger()) { lcdEnrollErr("TIMEOUT"); emit(F("{\"event\":\"enroll_fail\",\"code\":-1}")); enrollActive = false; return 0xFE; }
+    if (!waitFinger()) { lcdEnrollErr("TIMEOUT"); emit(F("{\"event\":\"enroll_fail\",\"code\":-1}")); autoScan = true; lcdShowIdle(); enrollActive = false; return 0xFE; }
 
     lcdEnrollStep("Capturing...", 75, "Reading fingerprint", COL_CYAN);
     flushRX(); delay(200);
@@ -726,7 +766,7 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
     if (p != FINGERPRINT_OK) {
       lcdEnrollErr("Bad Image #2");
       emit(F("{\"event\":\"bad_image\",\"step\":2,\"code\":%d}"), p);
-      if (!waitNoFinger()) { lcdEnrollErr("TIMEOUT"); enrollActive = false; return 0xFE; }
+      if (!waitNoFinger()) { lcdEnrollErr("TIMEOUT"); autoScan = true; lcdShowIdle(); enrollActive = false; return 0xFE; }
       continue;
     }
     lcdEnrollStep("Step 2 OK", 85, "Second scan captured", COL_OK);
@@ -740,10 +780,12 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
     snprintf(msg, sizeof(msg), "Retry %d/3", attempt + 1);
     lcdEnrollErr(msg);
     emit(F("{\"event\":\"retry_create\",\"attempt\":%d}"), attempt + 1);
-    if (!waitNoFinger()) { lcdEnrollErr("TIMEOUT"); enrollActive = false; return 0xFE; }
+    if (!waitNoFinger()) { lcdEnrollErr("TIMEOUT"); autoScan = true; lcdShowIdle(); enrollActive = false; return 0xFE; }
     if (attempt == 2) {
       lcdEnrollErr("Model FAILED");
       emit(F("{\"event\":\"enroll_fail\",\"code\":%d}"), p);
+      autoScan = true;
+      lcdShowIdle();
       enrollActive = false;
       return p;
     }
@@ -755,6 +797,8 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
   if (p != FINGERPRINT_OK) {
     lcdEnrollErr("Store FAILED");
     emit(F("{\"event\":\"enroll_fail\",\"code\":%d}"), p);
+    autoScan = true;
+    lcdShowIdle();
     enrollActive = false;
     return p;
   }
@@ -770,6 +814,7 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
 
   finger.getTemplateCount();
   fingerDown = false;
+  autoScan = true;
   lcdShowIdle();
   enrollActive = false;
   waitNoFinger();
@@ -921,6 +966,7 @@ void handleEnroll() {
 
   server.send(202, "application/json", "{\"ok\":true,\"id\":" + String(id) + ",\"name\":\"" + String(name) + "\"}");
 
+  autoScan = false;
   enrollFinger(id, name, empId);
 }
 
@@ -992,11 +1038,13 @@ void handleWifiStatus() {
   json += ",\"staSSID\":\"" + staSSID + "\"";
   json += ",\"apSSID\":\"" + String(AP_SSID) + "\"";
   json += ",\"apIP\":\"192.168.4.1\"";
-  json += ",\"hasSaved\":" + String(hasSavedWiFi ? "true" : "false");
-  if (hasSavedWiFi) {
-    json += ",\"savedSSID\":\"" + String(savedWiFi.ssid) + "\"";
+  json += ",\"savedCount\":" + String(savedWiFiCount);
+  json += ",\"saved\":[";
+  for (int i = 0; i < savedWiFiCount; i++) {
+    if (i > 0) json += ",";
+    json += "{\"ssid\":\"" + String(savedWiFi[i].ssid) + "\"}";
   }
-  json += "}";
+  json += "]}";
   server.send(200, "application/json", json);
 }
 
@@ -1034,7 +1082,8 @@ void handleWifiSave() {
     return;
   }
 
-  wifiSaveCreds(ssid, pass);
+  wifiLoadCreds();
+  wifiAddCreds(ssid, pass);
   server.send(200, "application/json", "{\"ok\":true,\"msg\":\"saved_rebooting\"}");
 
   delay(500);
@@ -1051,6 +1100,27 @@ void handleWifiReset() {
 
   delay(500);
   ESP.restart();
+}
+
+void handleWifiDelete() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (server.method() == HTTP_OPTIONS) { server.send(200); return; }
+  if (!requireAuth()) return;
+
+  DynamicJsonDocument doc(128);
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"bad_json\"}");
+    return;
+  }
+  const char *ssid = doc["ssid"] | "";
+  if (strlen(ssid) == 0) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"ssid_empty\"}");
+    return;
+  }
+
+  wifiLoadCreds();
+  wifiRemoveCreds(ssid);
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1606,6 +1676,8 @@ void setup() {
   server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
   server.on("/api/wifi/reset", HTTP_POST, handleWifiReset);
   server.on("/api/wifi/reset", HTTP_OPTIONS, handleWifiReset);
+  server.on("/api/wifi/delete", HTTP_POST, handleWifiDelete);
+  server.on("/api/wifi/delete", HTTP_OPTIONS, handleWifiDelete);
   // Settings API
   server.on("/api/settings", HTTP_GET, handleSettingsGet);
   server.on("/api/settings", HTTP_POST, handleSettingsSave);
@@ -1663,6 +1735,8 @@ void setup() {
   delay(400);
 
   if (ok) {
+    autoScan = true;
+    emit(F("{\"event\":\"autoscan_on\"}"));
     lcdShowIdle();
   } else {
     tft.fillScreen(COL_BG);
