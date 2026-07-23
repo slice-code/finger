@@ -76,6 +76,7 @@ td{padding:8px;border-bottom:1px solid var(--border)}
   <div class="tab" onclick="go('data')">Data</div>
   <div class="tab" onclick="go('wifi')">WiFi</div>
   <div class="tab" onclick="go('setel')">Setelan</div>
+  <div class="tab" onclick="go('cadangan')">Cadangan</div>
 </div>
 
 <div class="page on" id="p-dash">
@@ -174,11 +175,35 @@ td{padding:8px;border-bottom:1px solid var(--border)}
   </div>
 </div>
 
+<div class="page" id="p-cadangan">
+  <div class="card"><h3>Cadangan / Backup</h3>
+    <p style="font-size:13px;color:var(--dim);margin-bottom:8px">
+      Unduh data metadata sidik jari (nama + ID karyawan) sebagai file JSON.
+      Template biometric tetap aman di sensor FPM10A &mdash; tidak ikut diunduh.
+    </p>
+    <button class="btn btn-c" onclick="downloadBackup()">Unduh Metadata (.json)</button>
+    <button class="btn btn-g" onclick="downloadBackupFull()" style="margin-top:4px">Unduh Lengkap + Template (.json)</button>
+  </div>
+  <div class="card"><h3>Pulihkan / Restore</h3>
+    <p style="font-size:13px;color:var(--dim);margin-bottom:8px">
+      Unggah file cadangan untuk memulihkan data nama &amp; ID &amp; template sidik jari.
+      <strong style="color:var(--green)">Template di sensor TIDAK akan dihapus atau ditimpa.</strong>
+      Template yang belum ada di sensor akan ditulis ulang dari data cadangan.
+    </p>
+    <label>Pilih file .json (metadata atau full)</label>
+    <input type="file" id="restoreFile" accept=".json" onchange="handleRestoreFile(this)">
+    <button class="btn btn-g" id="restoreBtn" onclick="startRestore()" disabled>Mulai Pulihkan</button>
+    <div id="rprog" style="margin-top:10px;text-align:center;color:var(--dim);font-size:13px"></div>
+    <div id="rresult" style="margin-top:8px"></div>
+  </div>
+  <div class="card"><h3>Log</h3><div class="log" id="rlog"></div></div>
+</div>
+
 <script>
 var autoOn=false;
 function go(s){document.querySelectorAll('.page').forEach(p=>p.classList.remove('on'));
 document.getElementById('p-'+s).classList.add('on');
-document.querySelectorAll('.tab').forEach((t,i)=>{t.classList.toggle('on',['dash','enroll','data','wifi','setel'][i]===s)});
+document.querySelectorAll('.tab').forEach((t,i)=>{t.classList.toggle('on',['dash','enroll','data','wifi','setel','cadangan'][i]===s)});
 if(s==='data')loadData();if(s==='wifi')loadWifiStatus();if(s==='setel')loadSettings();if(s==='enroll')loadBranchList()}
 function addLog(el,cls,txt){var d=document.getElementById(el);var m=document.createElement('div');
 m.innerHTML='<span class="t">'+new Date().toLocaleTimeString()+'</span> <span class="'+cls+'">'+txt+'</span>';
@@ -365,6 +390,76 @@ api('/api/settings','POST',{apiBaseUrl:u,kode_cabang:c,device_id:dv}).then(d=>{
 if(d.ok){alert('Setelan tersimpan!');}
 }).catch(()=>alert('Gagal menyimpan'))}
 
+// ── Backup / Restore ──
+function downloadBackup(){
+window.location.href='/api/backup';
+addLog('rlog','cy','Mengunduh metadata...')}
+function downloadBackupFull(){
+window.location.href='/api/backup/full';
+addLog('rlog','cy','Mengunduh metadata + template...')}
+
+var restoreData=null;
+function handleRestoreFile(input){
+if(!input.files||!input.files[0])return;
+var reader=new FileReader();
+reader.onload=function(e){
+try{restoreData=JSON.parse(e.target.result);
+document.getElementById('restoreBtn').disabled=false;
+var fps=restoreData.fingerprints||restoreData;
+var cnt=Object.keys(fps).length;
+var tpl=restoreData.templates?Object.keys(restoreData.templates).length:0;
+var info='Data: '+cnt+' entries';
+if(tpl>0)info+=', Template: '+tpl;
+document.getElementById('rprog').innerHTML='Siap: '+info;
+addLog('rlog','ok','File terbaca: '+info)}
+catch(x){restoreData=null;document.getElementById('restoreBtn').disabled=true;
+document.getElementById('rprog').innerHTML='<span style="color:var(--red)">File tidak valid</span>';
+addLog('rlog','er','Gagal parse JSON')}};
+reader.readAsText(input.files[0])}
+
+function startRestore(){
+if(!restoreData)return;
+document.getElementById('restoreBtn').disabled=true;
+document.getElementById('rresult').innerHTML='';
+addLog('rlog','cy','Mulai pulihkan metadata...');
+var fps=restoreData.fingerprints||restoreData;
+var templates=restoreData.templates||{};
+// First restore metadata
+api('/api/restore','POST',{fingerprints:fps}).then(function(meta){
+if(meta.ok){
+addLog('rlog','ok','Metadata: '+meta.restored+' dipulihkan, '+meta.missing+' tanpa template');
+var tplKeys=Object.keys(templates).filter(function(k){return templates[k]&&templates[k].length>0});
+if(tplKeys.length==0){
+document.getElementById('rprog').innerHTML='<span style="color:var(--green)">Selesai (tanpa template)</span>';
+document.getElementById('restoreBtn').disabled=false;updStatus();return}
+addLog('rlog','cy','Mulai pulihkan '+tplKeys.length+' template...');
+var restored=0,failed=0,skipped=0;
+var idx=0;
+function nextTemplate(){
+if(idx>=tplKeys.length){
+var html='<div style="background:var(--green);color:#000;padding:12px;border-radius:8px;text-align:center;font-weight:700">';
+html+='Metadata OK | Template: '+restored+' restored, '+skipped+' skipped, '+failed+' failed</div>';
+document.getElementById('rresult').innerHTML=html;
+document.getElementById('restoreBtn').disabled=false;updStatus();return}
+var id=parseInt(tplKeys[idx]);
+document.getElementById('rprog').innerHTML='Template ID:'+id+' ('+(idx+1)+'/'+tplKeys.length+')...';
+api('/api/restore/template','POST',{id:id,data:templates[tplKeys[idx]]}).then(function(r){
+if(r.ok&&r.status=='restored')restored++;
+else if(r.ok&&r.status=='skipped')skipped++;
+else failed++;
+idx++;
+nextTemplate();
+}).catch(function(){failed++;idx++;nextTemplate()})}
+nextTemplate()
+}else{
+document.getElementById('rprog').innerHTML='<span style="color:var(--red)">Gagal: '+(meta.error||'unknown')+'</span>';
+document.getElementById('restoreBtn').disabled=false;
+addLog('rlog','er','Restore metadata gagal')}
+}).catch(function(e){
+document.getElementById('rprog').innerHTML='<span style="color:var(--red)">Error</span>';
+document.getElementById('restoreBtn').disabled=false;
+addLog('rlog','er','Network error')})}
+
 var es=new EventSource('/api/events');
 es.onmessage=function(e){
 try{var o=JSON.parse(e.data);handleEvent(o)}catch(x){}};
@@ -410,6 +505,11 @@ setScanState('fail','TIDAK DIKENALI','Sidik jari tidak terdaftar');
 addLog('slog','er','No match (code:'+o.code+')')}
 else if(t==='autoscan_err')
 addLog('slog','er','Scan error: '+(o.step||'')+' code:'+(o.code||''));
+else if(t==='restore_progress')
+document.getElementById('rprog').innerHTML='Memeriksa ID:'+o.id+' '+(o.template?'<span style="color:var(--green)">ada template</span>':'<span style="color:var(--red)">tanpa template</span>');
+else if(t==='restore_complete'){
+document.getElementById('rprog').innerHTML='<span style="color:var(--green)">Selesai</span>';
+addLog('rlog','ok','Restore selesai: '+o.restored+' ok, '+o.missing+' tanpa template')}
 else if(t==='attendance'){
 var st=o.response||{};
 var msg=st.status||'unknown';

@@ -47,6 +47,7 @@ bool autoScan = false;
 bool fingerDown = false;
 bool sensorReady = false;
 bool enrollActive = false;
+bool restoreActive = false;
 bool wifiConnected = false;
 String staIP = "";
 String staSSID = "";
@@ -1231,6 +1232,418 @@ void handleEmployees() {
   server.send(200, "application/json", resp);
 }
 
+// ────────────────────────────────────────────────────────────────────
+//  Fingerprint Template I/O (raw serial for 256-byte template data)
+// ────────────────────────────────────────────────────────────────────
+#define FINGERPRINT_DOWNLOAD 0x09
+
+// Fingerprint Command/Response helpers (raw serial, bypasses library)
+bool sendFingerCmd(const uint8_t *payload, uint8_t payloadLen, uint8_t *outType, uint8_t *outData, uint16_t *outDataLen) {
+  uint8_t hdr[] = {0xEF, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00};
+  uint16_t wLen = payloadLen + 2;
+  hdr[7] = wLen >> 8; hdr[8] = wLen & 0xFF;
+  uint16_t sum = 0;
+  for (int i = 6; i < 9; i++) sum += hdr[i];
+  for (int i = 0; i < payloadLen; i++) sum += payload[i];
+
+  flushRX();
+  altSerial.write(hdr, 9);
+  altSerial.write(payload, payloadLen);
+  altSerial.write((uint8_t)(sum >> 8));
+  altSerial.write((uint8_t)(sum & 0xFF));
+  altSerial.flush();
+
+  unsigned long start = millis();
+  uint8_t buf[300];
+  uint16_t idx = 0;
+  while (millis() - start < 2000 && idx < sizeof(buf)) {
+    if (altSerial.available()) {
+      uint8_t b = altSerial.read();
+      if (idx == 0 && b != 0xEF) continue;
+      buf[idx++] = b;
+      if (idx >= 9) {
+        uint16_t pLen = 9 + ((uint16_t)buf[7] << 8 | buf[8]);
+        if (idx >= pLen) {
+          if (outType) *outType = buf[6];
+          if (outDataLen) *outDataLen = pLen - 9;
+          if (outData) memcpy(outData, buf + 9, (pLen - 9 > 256 ? 256 : pLen - 9));
+          return true;
+        }
+      }
+    }
+    delay(1);
+  }
+  return false;
+}
+
+// Read 256-byte template from sensor for given ID
+// Read 256-byte template from sensor for given ID (sent as two 128-byte DATA packets)
+bool getTemplateRaw(uint16_t id, uint8_t *buf) {
+  if (finger.loadModel(id) != FINGERPRINT_OK) return false;
+  delay(30);
+  flushRX();
+
+  uint8_t upHdr[] = {0xEF,0x01,0xFF,0xFF,0xFF,0xFF,0x01,0x00,0x04};
+  uint16_t upSum = 0;
+  for (int i=6;i<9;i++) upSum += upHdr[i];
+  upSum += 0x08 + 0x01;
+  altSerial.write(upHdr,9);
+  altSerial.write((uint8_t)0x08); altSerial.write((uint8_t)0x01);
+  altSerial.write((uint8_t)(upSum>>8));
+  altSerial.write((uint8_t)(upSum&0xFF));
+  altSerial.flush();
+
+  unsigned long start = millis();
+  uint8_t pkt[500];
+  uint16_t idx = 0;
+  while (millis()-start < 3000 && idx < sizeof(pkt)) {
+    if (altSerial.available()) {
+      pkt[idx++] = altSerial.read();
+    }
+    delay(1);
+  }
+  if (idx < 9) return false;
+
+  // Scan for DATA packets (type 0x02, wire_len=130 = 128 data + 2 chk)
+  uint8_t chunks[2][128];
+  uint8_t chunkCount = 0;
+  for (uint16_t i = 0; i <= idx - 9 && chunkCount < 2; i++) {
+    if (pkt[i]==0xEF && pkt[i+1]==0x01 && pkt[i+6]==0x02) {
+      uint16_t wLen = ((uint16_t)pkt[i+7] << 8) | pkt[i+8];
+      if (wLen >= 130 && i + 9 + 128 <= idx) {
+        memcpy(chunks[chunkCount], pkt + i + 9, 128);
+        chunkCount++;
+      }
+    }
+  }
+
+  if (chunkCount == 0) return false;
+  memcpy(buf, chunks[0], 128);
+  if (chunkCount >= 2) memcpy(buf + 128, chunks[1], 128);
+  else memset(buf + 128, 0, 128);
+  return true;
+}
+
+// Write 256-byte template to sensor (two 128-byte DownChar calls, then storeModel)
+bool putTemplateRaw(uint16_t id, const uint8_t *buf) {
+  // 1. DownChar buffer 1 with first 128 bytes
+  for (uint8_t buffer = 1; buffer <= 2; buffer++) {
+    flushRX();
+    uint8_t hdr[] = {0xEF,0x01,0xFF,0xFF,0xFF,0xFF,0x01,0x00,0x00};
+    uint16_t wLen = 2 + 128 + 2; // cmd + param + data(128) + chk(2)
+    hdr[7] = wLen >> 8; hdr[8] = wLen & 0xFF;
+    uint16_t sum = 0;
+    for (int i = 6; i < 9; i++) sum += hdr[i];
+    sum += 0x09 + buffer;
+    const uint8_t *chunk = buf + (buffer - 1) * 128;
+    for (int i = 0; i < 128; i++) sum += chunk[i];
+
+    altSerial.write(hdr, 9);
+    altSerial.write((uint8_t)0x09);
+    altSerial.write(buffer);
+    altSerial.write(chunk, 128);
+    altSerial.write((uint8_t)(sum >> 8));
+    altSerial.write((uint8_t)(sum & 0xFF));
+    altSerial.flush();
+
+    // Read ACK
+    uint8_t resp[12];
+    uint16_t ri = 0;
+    unsigned long start = millis();
+    while (ri < 11 && millis() - start < 2000) {
+      if (altSerial.available()) {
+        uint8_t b = altSerial.read();
+        if (ri == 0 && b != 0xEF) continue;
+        resp[ri++] = b;
+      }
+      delay(1);
+    }
+    if (ri < 11 || resp[9] != 0x00) return false;
+    delay(20);
+  }
+
+  // 2. Store buffer 1+2 to flash using library
+  return finger.storeModel(id) == FINGERPRINT_OK;
+}
+
+String toHex(const uint8_t *buf, size_t len) {
+  String r;
+  for (size_t i = 0; i < len; i++) {
+    if (buf[i] < 0x10) r += '0';
+    r += String(buf[i], HEX);
+  }
+  return r;
+}
+
+bool fromHex(const char *hex, uint8_t *buf, size_t maxLen) {
+  size_t hexLen = strlen(hex);
+  if (hexLen % 2 != 0 || hexLen / 2 > maxLen) return false;
+  for (size_t i = 0; i < hexLen / 2; i++) {
+    char hi = hex[i * 2];
+    char lo = hex[i * 2 + 1];
+    buf[i] = ((hi >= 'a' ? hi - 'a' + 10 : hi >= 'A' ? hi - 'A' + 10 : hi - '0') << 4) |
+              (lo >= 'a' ? lo - 'a' + 10 : lo >= 'A' ? lo - 'A' + 10 : lo - '0');
+  }
+  return true;
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  Backup (metadata only)
+// ────────────────────────────────────────────────────────────────────
+String jsonEscape(const char *s) {
+  String r;
+  for (size_t i = 0; s[i]; i++) {
+    char c = s[i];
+    if (c == '"') r += "\\\"";
+    else if (c == '\\') r += "\\\\";
+    else if (c == '\n') r += "\\n";
+    else if (c == '\r') r += "\\r";
+    else if (c == '\t') r += "\\t";
+    else if (c >= 0x20) r += c;
+  }
+  return r;
+}
+
+void handleBackup() {
+  if (!requireAuth()) return;
+  if (enrollActive || restoreActive) { server.send(503, "application/json", "{\"ok\":false,\"error\":\"busy\"}"); return; }
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Content-Disposition", "attachment; filename=fpm10a-backup.json");
+
+  finger.getTemplateCount();
+
+  String json = "{\"version\":1";
+  json += ",\"deviceInfo\":{";
+  json += "\"templateCount\":" + String(finger.templateCount);
+  json += ",\"securityLevel\":" + String(finger.security_level);
+  json += ",\"baud\":" + String(curBaud);
+  json += "}";
+  json += ",\"fingerprints\":{";
+  for (int i = 0; i < fpCount; i++) {
+    if (i > 0) json += ",";
+    json += "\"" + String(fpDB[i].id) + "\":{";
+    json += "\"name\":\"" + jsonEscape(fpDB[i].name) + "\"";
+    if (fpDB[i].empId[0]) json += ",\"employeeId\":\"" + jsonEscape(fpDB[i].empId) + "\"";
+    json += "}";
+  }
+  json += "}}";
+  server.send(200, "application/json", json);
+}
+
+void handleRestore() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (server.method() == HTTP_OPTIONS) { server.send(200); return; }
+  if (!requireAuth()) return;
+  if (enrollActive || restoreActive) {
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"busy\"}");
+    return;
+  }
+
+  DynamicJsonDocument doc(16384);
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if (err) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"bad_json\"}");
+    return;
+  }
+
+  // Support both new format (with "fingerprints" key) and flat format
+  JsonObject fps;
+  if (doc.containsKey("fingerprints")) {
+    fps = doc["fingerprints"].as<JsonObject>();
+  } else {
+    fps = doc.as<JsonObject>();
+  }
+
+  restoreActive = true;
+  bool oldAuto = autoScan;
+  autoScan = false;
+
+  int restored = 0, missing = 0;
+  String detail = "[";
+  bool first = true;
+
+  for (JsonPair p : fps) {
+    uint8_t id = atoi(p.key().c_str());
+    if (id == 0) continue;
+
+    JsonObject info = p.value().as<JsonObject>();
+    const char *name = info["name"] | "";
+    const char *empId = info["employeeId"] | "";
+
+    // Check if template exists on sensor (NEVER delete or overwrite sensor data)
+    flushRX();
+    delay(30);
+    bool templateExists = (finger.loadModel(id) == FINGERPRINT_OK);
+
+    // Always restore metadata to LittleFS
+    dbAdd(id, name, empId);
+
+    if (!first) detail += ",";
+    first = false;
+    detail += "{\"id\":" + String(id);
+    detail += ",\"template\":" + String(templateExists ? "true" : "false");
+    detail += ",\"name\":\"" + jsonEscape(name) + "\"";
+    if (empId[0]) detail += ",\"employeeId\":\"" + jsonEscape(empId) + "\"";
+    detail += "}";
+
+    if (templateExists) restored++;
+    else missing++;
+
+    emit(F("{\"event\":\"restore_progress\",\"id\":%d,\"template\":%s}"), id, templateExists ? "true" : "false");
+
+    delay(10);
+    yield();
+  }
+
+  detail += "]";
+
+  finger.getTemplateCount();
+
+  if (oldAuto) { autoScan = true; lcdShowIdle(); }
+  restoreActive = false;
+
+  String resp = "{\"ok\":true,\"restored\":" + String(restored);
+  resp += ",\"missing\":" + String(missing);
+  resp += ",\"detail\":" + detail + "}";
+  server.send(200, "application/json", resp);
+  emit(F("{\"event\":\"restore_complete\",\"restored\":%d,\"missing\":%d}"), restored, missing);
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  Full Backup (metadata + template biometric as hex)
+// ────────────────────────────────────────────────────────────────────
+void handleBackupFull() {
+  if (!requireAuth()) return;
+  if (enrollActive || restoreActive) { server.send(503, "application/json", "{\"ok\":false,\"error\":\"busy\"}"); return; }
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Content-Disposition", "attachment; filename=fpm10a-backup-full.json");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "{\"version\":1");
+
+  finger.getTemplateCount();
+  String s;
+  s = ",\"deviceInfo\":{";
+  s += "\"templateCount\":" + String(finger.templateCount);
+  s += ",\"securityLevel\":" + String(finger.security_level);
+  s += ",\"baud\":" + String(curBaud);
+  s += "}";
+  server.sendContent(s);
+
+  s = ",\"fingerprints\":{";
+  for (int i = 0; i < fpCount; i++) {
+    if (i > 0) s += ",";
+    s += "\"" + String(fpDB[i].id) + "\":{";
+    s += "\"name\":\"" + jsonEscape(fpDB[i].name) + "\"";
+    if (fpDB[i].empId[0]) s += ",\"employeeId\":\"" + jsonEscape(fpDB[i].empId) + "\"";
+    s += "}";
+  }
+  s += "}";
+  server.sendContent(s);
+
+  s = ",\"templates\":{";
+  server.sendContent(s);
+  for (int i = 0; i < fpCount; i++) {
+    uint8_t tpl[256];
+    bool ok = getTemplateRaw(fpDB[i].id, tpl);
+    s = "\"" + String(fpDB[i].id) + "\":\"";
+    if (ok) s += toHex(tpl, 256);
+    s += "\"";
+    if (i < fpCount - 1) s += ",";
+    server.sendContent(s);
+    delay(5);
+    yield();
+  }
+  server.sendContent("}}");
+}
+
+// ────────────────────────────────────────────────────────────────────
+//  Restore Single Template
+// ────────────────────────────────────────────────────────────────────
+void handleRestoreTemplate() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (server.method() == HTTP_OPTIONS) { server.send(200); return; }
+  if (!requireAuth()) return;
+  if (enrollActive || restoreActive) {
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"busy\"}");
+    return;
+  }
+
+  DynamicJsonDocument doc(1024);
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"bad_json\"}");
+    return;
+  }
+
+  uint16_t id = doc["id"] | 0;
+  const char *hex = doc["data"] | "";
+
+  if (id == 0 || strlen(hex) == 0) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"id_or_data_empty\"}");
+    return;
+  }
+
+  restoreActive = true;
+  bool oldAuto = autoScan;
+  autoScan = false;
+
+  uint8_t tpl[256];
+  bool hexOk = fromHex(hex, tpl, 256);
+  if (!hexOk) {
+    if (oldAuto) { autoScan = true; }
+    restoreActive = false;
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_hex\"}");
+    return;
+  }
+
+  // Check if template already exists on sensor
+  flushRX();
+  delay(30);
+  bool exists = (finger.loadModel(id) == FINGERPRINT_OK);
+
+  if (exists) {
+    // Skip: template already on sensor
+    if (oldAuto) { autoScan = true; }
+    restoreActive = false;
+    server.send(200, "application/json", "{\"ok\":true,\"id\":" + String(id) + ",\"status\":\"skipped\"}");
+    return;
+  }
+
+  // Write template to sensor
+  bool ok = putTemplateRaw(id, tpl);
+  if (ok) {
+    finger.getTemplateCount();
+    emit(F("{\"event\":\"template_restored\",\"id\":%d}"), id);
+  }
+
+  if (oldAuto) { autoScan = true; }
+  restoreActive = false;
+
+  String resp = "{\"ok\":" + String(ok ? "true" : "false");
+  resp += ",\"id\":" + String(id);
+  resp += ",\"status\":\"" + String(ok ? "restored" : "failed") + "\"}";
+  server.send(ok ? 200 : 500, "application/json", resp);
+}
+
+void handleStorage() {
+  if (!requireAuth()) return;
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  FSInfo fs;
+  LittleFS.info(fs);
+  String json = "{\"ok\":true";
+  json += ",\"total\":" + String(fs.totalBytes);
+  json += ",\"used\":" + String(fs.usedBytes);
+  json += ",\"free\":" + String(fs.totalBytes - fs.usedBytes);
+  json += ",\"blockSize\":" + String(fs.blockSize);
+  json += ",\"pageSize\":" + String(fs.pageSize);
+  json += ",\"maxOpenFiles\":" + String(fs.maxOpenFiles);
+  json += ",\"maxPathLength\":" + String(fs.maxPathLength);
+  json += ",\"sketchSize\":" + String(ESP.getSketchSize());
+  json += ",\"freeSketchSpace\":" + String(ESP.getFreeSketchSpace());
+  json += ",\"freeHeap\":" + String(ESP.getFreeHeap());
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
 void handleNotFound() {
   if (server.method() == HTTP_OPTIONS) { server.send(200); return; }
   server.send(404, "application/json", "{\"error\":\"not_found\"}");
@@ -1687,6 +2100,14 @@ void setup() {
   server.on("/api/branches", HTTP_OPTIONS, handleBranches);
   server.on("/api/employees", HTTP_GET, handleEmployees);
   server.on("/api/employees", HTTP_OPTIONS, handleEmployees);
+  // Backup / Restore API
+  server.on("/api/backup", HTTP_GET, handleBackup);
+  server.on("/api/backup/full", HTTP_GET, handleBackupFull);
+  server.on("/api/restore", HTTP_POST, handleRestore);
+  server.on("/api/restore", HTTP_OPTIONS, handleRestore);
+  server.on("/api/restore/template", HTTP_POST, handleRestoreTemplate);
+  server.on("/api/restore/template", HTTP_OPTIONS, handleRestoreTemplate);
+  server.on("/api/storage", HTTP_GET, handleStorage);
   server.onNotFound(handleNotFound);
   server.begin();
 
