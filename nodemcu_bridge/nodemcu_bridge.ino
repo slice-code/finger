@@ -415,6 +415,7 @@ bool nextLine(char *out, size_t n) {
 
 bool waitNoFinger() {
   unsigned long t = millis();
+  finger.LEDcontrol(false);
   while (millis() - t < 10000) {
     flushRX();
     if (finger.getImage() == FINGERPRINT_NOFINGER) return true;
@@ -425,11 +426,13 @@ bool waitNoFinger() {
 
 bool waitFinger() {
   unsigned long t = millis();
+  finger.LEDcontrol(true);
   while (millis() - t < 10000) {
     flushRX();
-    if (finger.getImage() == FINGERPRINT_OK) return true;
+    if (finger.getImage() == FINGERPRINT_OK) { finger.LEDcontrol(false); return true; }
     delay(50); yield();
   }
+  finger.LEDcontrol(false);
   return false;
 }
 
@@ -832,6 +835,7 @@ void doAutoScan() {
     returnTimer--;
     if (returnTimer == 0) {
       fingerDown = false;
+      finger.LEDcontrol(false);
       lcdShowIdle();
     }
     return;
@@ -841,6 +845,7 @@ void doAutoScan() {
   int p = finger.getImage();
   if (p == FINGERPRINT_OK) {
     if (fingerDown) return;
+    finger.LEDcontrol(true);
     lcdShowScanning();
     p = finger.image2Tz();
     if (p != FINGERPRINT_OK) {
@@ -1020,6 +1025,7 @@ void handleAutoOff() {
   if (server.method() == HTTP_OPTIONS) { server.send(200); return; }
   if (!requireAuth()) return;
   autoScan = false;
+  finger.LEDcontrol(false);
   finger.getTemplateCount();
   lcdShowIdle();
   server.send(200, "application/json", "{\"ok\":true,\"autoActive\":false}");
@@ -2157,6 +2163,7 @@ void setup() {
 
   if (ok) {
     autoScan = true;
+    finger.LEDcontrol(false);
     emit(F("{\"event\":\"autoscan_on\"}"));
     lcdShowIdle();
   } else {
