@@ -42,17 +42,39 @@ WiFi.mode(WIFI_AP_STA); // re-enable after detection
 4. **Do NOT add blocking loops** during sensor communication — use state machine pattern
 5. **If adding new WiFi features**, ensure they don't trigger heavy background tasks during sensor scans
 
+## Recovery Mechanism
+
+The sensor uses WiFi SoftwareSerial which is inherently unreliable on ESP8266. Two failure modes exist:
+
+### Mode 1: Scanning Error → ESP.restart()
+When WiFi interrupts corrupt scanning communication:
+1. `getImage()` returns error codes → `consecutiveErrors` increments
+2. After `MAX_CONSECUTIVE_ERRORS` (5) → **immediate `ESP.restart()`**
+3. Boot sequence re-detects sensor with WiFi OFF → works reliably
+4. WiFi reconnects after sensor is ready
+
+### Mode 2: Boot Detection Failure → Retry then Restart
+When sensor can't be detected at boot:
+1. `reinitSensor()` called every 5s with WiFi OFF + 3s cooldown
+2. Phase 1: Try 9600 baud 8 times (FPM10A default)
+3. Phase 2: Try all 5 bauds × 5 attempts each
+4. After `MAX_RECOVERY` (3) failed reinit attempts → **`ESP.restart()`**
+
+### Why reinitSensor() alone can't recover
+When sensor communication breaks mid-scan, the FPM10A enters an unrecoverable state. Even with WiFi OFF, `verifyPassword()` fails at ALL baud rates. Only a full power cycle (or ESP restart) resets the sensor properly. This is a known limitation of ESP8266 + SoftwareSerial + FPM10A.
+
 ## Key State Variables
 - `autoScan` (bool): Enable/disable automatic scanning
 - `sensorReady` (bool): Sensor communication is working
 - `scanState` (enum): `SCAN_IDLE` → `SCAN_BUSY` → `SCAN_WAIT_RELEASE`
-- `consecutiveErrors` (int): Count of consecutive `getImage()` failures (max 5 before reinit)
+- `consecutiveErrors` (int): Count of consecutive `getImage()` failures (max 5 before ESP.restart())
 - `lastScanActivity` (unsigned long): Timestamp of last sensor activity (watchdog 15s)
 - `recoveryCount` (int): Recovery attempts before ESP.restart() (max 3)
 
 ## Key Functions
 - `doAutoScan()` — Non-blocking state machine for fingerprint scanning
-- `reinitSensor()` — WiFi OFF → detect sensor → WiFi ON (used by watchdog)
+- `reinitSensor()` — WiFi OFF → detect sensor → WiFi AP on (no STA reconnect)
+- `wifiReconnect()` — Reconnect to saved WiFi network (called after reinit succeeds)
 - `watchdogCheck()` — Triggers reinit after 15s inactivity
 - `postAttendance()` — Sends attendance to server with NTP timestamp
 

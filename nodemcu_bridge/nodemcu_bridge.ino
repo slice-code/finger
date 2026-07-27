@@ -954,10 +954,10 @@ void doAutoScan() {
         flushRX();
 
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-          Serial.printf("[SCAN] %d consecutive errors → reinit sensor!\n", consecutiveErrors);
-          consecutiveErrors = 0;
-          autoScan = false;
-          sensorReady = false;
+          Serial.printf("[SCAN] %d consecutive errors → ESP.restart()\n", consecutiveErrors);
+          emit(F("{\"event\":\"sensor_restarting\"}"));
+          delay(200);
+          ESP.restart();
         }
         delay(200); // throttle error loop
       }
@@ -2195,42 +2195,64 @@ updStatus();setInterval(updStatus,5000);
 //  AUTO-RECOVERY: re-init sensor & restart auto-scan
 // ────────────────────────────────────────────────────────────────────
 bool reinitSensor() {
-  Serial.println("[WATCHDOG] Re-init sensor (WiFi OFF)...");
+  Serial.println("[SENSOR] Re-init sensor (WiFi OFF)...");
   autoScan = false;
   sensorReady = false;
 
-  // Matikan WiFi saat deteksi
-  bool wasWifiConnected = wifiConnected;
-  String wasStaSSID = staSSID;
+  // Matikan WiFi
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   delay(100);
   yield();
-  delay(500);
+
+  // Tunggu sensor stabil setelah WiFi OFF (serial line clear)
+  delay(3000);
 
   bool ok = false;
   curBaud = 0;
-  const unsigned long tryBauds[] = {9600, 57600, 19200, 38400, 115200};
 
-  for (int i = 0; i < 5 && !ok; i++) {
-    unsigned long baud = tryBauds[i];
-    Serial.printf("[WATCHDOG] Baud %lu...\n", baud);
+  // Phase 1: Fokus di 9600 (default FPM10A) — coba 8x
+  Serial.println("[SENSOR] Phase1: 9600 x8...");
+  altSerial.end();
+  delay(200);
+  altSerial.begin(9600);
+  delay(400);
+  flushRX();
+  finger.begin(9600);
+  delay(300);
 
-    altSerial.end();
-    delay(150);
-    altSerial.begin(baud);
-    delay(300);
-    flushRX();
-    finger.begin(baud);
-    delay(200);
+  for (int attempt = 0; attempt < 8 && !ok; attempt++) {
+    Serial.printf("[SENSOR] 9600 try %d/8\n", attempt + 1);
+    if (finger.verifyPassword()) {
+      curBaud = 9600;
+      ok = true;
+    } else {
+      delay(200);
+      flushRX();
+    }
+  }
 
-    for (int attempt = 0; attempt < 5 && !ok; attempt++) {
-      if (finger.verifyPassword()) {
-        curBaud = baud;
-        ok = true;
-      } else {
-        delay(100);
-        flushRX();
+  // Phase 2: Coba semua baud
+  if (!ok) {
+    const unsigned long tryBauds[] = {9600, 57600, 19200, 38400, 115200};
+    for (int i = 0; i < 5 && !ok; i++) {
+      unsigned long baud = tryBauds[i];
+      Serial.printf("[SENSOR] Phase2: Baud %lu...\n", baud);
+      altSerial.end();
+      delay(200);
+      altSerial.begin(baud);
+      delay(400);
+      flushRX();
+      finger.begin(baud);
+      delay(300);
+      for (int attempt = 0; attempt < 5 && !ok; attempt++) {
+        if (finger.verifyPassword()) {
+          curBaud = baud;
+          ok = true;
+        } else {
+          delay(150);
+          flushRX();
+        }
       }
     }
   }
@@ -2239,31 +2261,6 @@ bool reinitSensor() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleepMode(WIFI_LIGHT_SLEEP);
   WiFi.softAP(AP_SSID, cred.apPass);
-  if (wasWifiConnected && wasStaSSID.length() > 0) {
-    for (int i = 0; i < savedWiFiCount; i++) {
-      if (String(savedWiFi[i].ssid) == wasStaSSID) {
-        WiFi.begin(savedWiFi[i].ssid, savedWiFi[i].pass);
-        break;
-      }
-    }
-    unsigned long start = millis();
-    while (millis() - start < 10000) {
-      if (WiFi.status() == WL_CONNECTED) break;
-      delay(100);
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      wifiConnected = true;
-      staIP = WiFi.localIP().toString();
-      staSSID = wasStaSSID;
-      WiFi.softAPdisconnect(true);
-      Serial.printf("[WiFi] Reconnected to %s | IP: %s\n", staSSID.c_str(), staIP.c_str());
-    } else {
-      wifiConnected = false;
-      Serial.println("[WiFi] Reconnect failed, AP mode");
-    }
-  } else {
-    Serial.println("[WiFi] AP mode active");
-  }
 
   if (ok) {
     delay(200);
@@ -2284,15 +2281,41 @@ bool reinitSensor() {
     autoScan = true;
     scanState = SCAN_IDLE;
     lastScanActivity = millis();
-    recoveryCount = 0;
     consecutiveErrors = 0;
+    recoveryCount = 0;
     lcdShowIdle();
     emit(F("{\"event\":\"autoscan_on\"}"));
-    Serial.printf("[WATCHDOG] Recovered baud=%lu templates=%d\n", curBaud, finger.templateCount);
+    Serial.printf("[SENSOR] Recovered baud=%lu templates=%d\n", curBaud, finger.templateCount);
   } else {
-    Serial.println("[WATCHDOG] Re-init FAILED");
+    Serial.println("[SENSOR] Re-init FAILED");
   }
   return ok;
+}
+
+// ── WiFi reconnect (dipanggil setelah reinitSensor) ──
+void wifiReconnect() {
+  if (wifiConnected) return; // sudah connected
+  if (savedWiFiCount == 0) return; // tidak ada saved WiFi
+
+  for (int i = 0; i < savedWiFiCount; i++) {
+    Serial.printf("[WiFi] Reconnect to %s...\n", savedWiFi[i].ssid);
+    WiFi.begin(savedWiFi[i].ssid, savedWiFi[i].pass);
+    unsigned long start = millis();
+    while (millis() - start < 8000) {
+      if (WiFi.status() == WL_CONNECTED) break;
+      delay(100);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+      staIP = WiFi.localIP().toString();
+      staSSID = String(savedWiFi[i].ssid);
+      WiFi.softAPdisconnect(true);
+      Serial.printf("[WiFi] Connected to %s | IP: %s\n", staSSID.c_str(), staIP.c_str());
+      return;
+    }
+    WiFi.disconnect();
+  }
+  Serial.println("[WiFi] All reconnect attempts failed, AP mode");
 }
 
 void watchdogCheck() {
@@ -2555,15 +2578,27 @@ void loop() {
     watchdogCheck();
     delay(25);
   } else {
-    // auto reconnect sensor tiap 5 detik (lebih sabar)
+    // auto reconnect sensor
     static unsigned long lastRetry = 0;
     if (millis() - lastRetry > 5000) {
       lastRetry = millis();
       Serial.println("[LOOP] Trying sensor reconnect...");
       if (reinitSensor()) {
         Serial.println("[LOOP] Sensor reconnected!");
+        recoveryCount = 0;
+        // WiFi reconnect setelah sensor ok (non-blocking)
+        wifiReconnect();
       } else {
-        Serial.println("[LOOP] Reconnect failed, retrying...");
+        recoveryCount++;
+        Serial.printf("[LOOP] Reconnect failed (%d/%d)\n", recoveryCount, MAX_RECOVERY);
+        WiFi.mode(WIFI_AP_STA); // pastikan AP tetap jalan untuk web UI
+        WiFi.softAP(AP_SSID, cred.apPass);
+        if (recoveryCount >= MAX_RECOVERY) {
+          Serial.println("[LOOP] Max recovery, ESP.restart()");
+          emit(F("{\"event\":\"watchdog_reset\"}"));
+          delay(500);
+          ESP.restart();
+        }
       }
     }
     delay(50);
