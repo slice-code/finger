@@ -76,6 +76,7 @@ td{padding:8px;border-bottom:1px solid var(--border)}
   <div class="tab" onclick="go('data')">Data</div>
   <div class="tab" onclick="go('wifi')">WiFi</div>
   <div class="tab" onclick="go('setel')">Setelan</div>
+  <div class="tab" onclick="go('akun')">Akun</div>
   <div class="tab" onclick="go('cadangan')">Cadangan</div>
 </div>
 
@@ -175,6 +176,27 @@ td{padding:8px;border-bottom:1px solid var(--border)}
   </div>
 </div>
 
+<div class="page" id="p-akun">
+  <div class="card"><h3>Autentikasi Web</h3>
+    <label>Username</label><input id="akuser" placeholder="Username login web">
+    <label>Password Baru</label><input id="akpass" type="password" placeholder="Kosongkan jika tidak diubah">
+    <button class="btn btn-c" onclick="saveCred()">Simpan</button>
+  </div>
+  <div class="card"><h3>WiFi AP</h3>
+    <label>Password AP Baru</label><input id="akapass" type="password" placeholder="Kosongkan jika tidak diubah">
+    <div style="font-size:12px;color:var(--dim);margin-top:4px">SSID: FPM10A-Bridge (tetap)</div>
+  </div>
+  <div class="card"><h3>NTP (Waktu)</h3>
+    <label>NTP Server</label><input id="akntp" placeholder="id.pool.ntp.org">
+    <label>UTC Offset (detik)</label><input id="akoff" type="number" placeholder="25200 (WIB)">
+    <div style="font-size:12px;color:var(--dim);margin-top:4px">
+      Waktu sekarang: <span id="aktime" style="color:var(--cyan)">--:--:--</span>
+      <span id="aksync" style="color:var(--dim)">(belum sync)</span>
+    </div>
+    <button class="btn btn-c" onclick="saveCred()">Simpan & Reboot</button>
+  </div>
+</div>
+
 <div class="page" id="p-cadangan">
   <div class="card"><h3>Cadangan / Backup</h3>
     <p style="font-size:13px;color:var(--dim);margin-bottom:8px">
@@ -203,8 +225,8 @@ td{padding:8px;border-bottom:1px solid var(--border)}
 var autoOn=false;
 function go(s){document.querySelectorAll('.page').forEach(p=>p.classList.remove('on'));
 document.getElementById('p-'+s).classList.add('on');
-document.querySelectorAll('.tab').forEach((t,i)=>{t.classList.toggle('on',['dash','enroll','data','wifi','setel','cadangan'][i]===s)});
-if(s==='data')loadData();if(s==='wifi')loadWifiStatus();if(s==='setel')loadSettings();if(s==='enroll')loadBranchList()}
+document.querySelectorAll('.tab').forEach((t,i)=>{t.classList.toggle('on',['dash','enroll','data','wifi','setel','akun','cadangan'][i]===s)});
+if(s==='data')loadData();if(s==='wifi')loadWifiStatus();if(s==='setel')loadSettings();if(s==='akun')loadCred();if(s==='enroll')loadBranchList()}
 function addLog(el,cls,txt){var d=document.getElementById(el);var m=document.createElement('div');
 m.innerHTML='<span class="t">'+new Date().toLocaleTimeString()+'</span> <span class="'+cls+'">'+txt+'</span>';
 d.prepend(m);if(d.children.length>50)d.lastChild.remove()}
@@ -390,6 +412,35 @@ api('/api/settings','POST',{apiBaseUrl:u,kode_cabang:c,device_id:dv}).then(d=>{
 if(d.ok){alert('Setelan tersimpan!');}
 }).catch(()=>alert('Gagal menyimpan'))}
 
+// ── Credentials ──
+function loadCred(){
+api('/api/credentials').then(d=>{
+document.getElementById('akuser').value=d.webUser||'';
+document.getElementById('akntp').value=d.ntpServer||'id.pool.ntp.org';
+document.getElementById('akoff').value=d.utcOffset||25200;
+document.getElementById('aktime').textContent=d.ntpTime||'--:--:--';
+document.getElementById('aksync').textContent=d.ntpSynced?'(tersync)':'(belum sync)';
+document.getElementById('aksync').style.color=d.ntpSynced?'var(--green)':'var(--dim)';
+}).catch(()=>{})}
+
+function saveCred(){
+var body={};
+var u=document.getElementById('akuser').value.trim();
+var p=document.getElementById('akpass').value;
+var ap=document.getElementById('akapass').value;
+var ntp=document.getElementById('akntp').value.trim();
+var off=parseInt(document.getElementById('akoff').value)||25200;
+if(u)body.webUser=u;
+if(p)body.webPass=p;
+if(ap)body.apPass=ap;
+if(ntp)body.ntpServer=ntp;
+body.utcOffset=off;
+if(!Object.keys(body).length){alert('Tidak ada perubahan');return}
+if(!confirm('Simpan & reboot?'))return;
+api('/api/credentials','POST',body).then(d=>{
+if(d.ok){alert('Tersimpan! Rebooting...');}
+}).catch(()=>alert('Gagal menyimpan'))}
+
 // ── Backup / Restore ──
 function downloadBackup(){
 window.location.href='/api/backup';
@@ -505,6 +556,9 @@ setScanState('fail','TIDAK DIKENALI','Sidik jari tidak terdaftar');
 addLog('slog','er','No match (code:'+o.code+')')}
 else if(t==='autoscan_err')
 addLog('slog','er','Scan error: '+(o.step||'')+' code:'+(o.code||''));
+else if(t==='watchdog_reset'){
+addLog('elog','er','WATCHDOG: Device restart');
+updStatus()}
 else if(t==='restore_progress')
 document.getElementById('rprog').innerHTML='Memeriksa ID:'+o.id+' '+(o.template?'<span style="color:var(--green)">ada template</span>':'<span style="color:var(--red)">tanpa template</span>');
 else if(t==='restore_complete'){
