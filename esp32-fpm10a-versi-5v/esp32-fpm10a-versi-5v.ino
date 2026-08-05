@@ -121,6 +121,7 @@ struct AppSettings {
   char apiBaseUrl[128];
   char kodeCabang[16];
   char deviceId[32];
+  char apiKey[65];         // X-Device-Key untuk auth ke PJTKI server
   uint8_t scanStartHour;  // jam mulai scan (0-23)
   uint8_t scanEndHour;    // jam selesai scan (0-23)
   bool scanSchedule;      // true = pakai jadwal
@@ -137,50 +138,57 @@ int fpCount = 0;
 #define MAX_SSE_CLIENTS 4
 WiFiClient sseClients[MAX_SSE_CLIENTS];
 
-// ── Sidebar Accent Theme (Teal) ─────────────────────────────────────
-#define COL_BG        TFT_BLACK
-#define COL_SIDEBAR   0x4611   // #41c38c — teal accent
-#define COL_PANEL     0x0862   // dark teal card bg
-#define COL_TOPBAR    0x0421   // dark bg
-#define COL_ACCENT    0x4611   // teal highlight
-#define COL_ACCENT2   0x3C0F   // muted teal
-#define COL_ACCENT3   0x6E33   // light teal
-#define COL_TEXT      TFT_WHITE
-#define COL_DIM       0x5AEB   // soft gray
-#define COL_DIM2      0x2945   // darker gray
-#define COL_DIM3      0x18A3   // very dark gray
-#define COL_OK        0x4611   // teal (ganti dari hijau)
-#define COL_OK_DARK   0x230A   // dark teal
-#define COL_ERR       0xF800   // red
-#define COL_ERR_DARK  0x6000   // dark red
-#define COL_WARN      0xFFE0   // yellow
-#define COL_GOLD      0xFD20   // gold
-#define SIDEBAR_W     5
+// ── PJTKI Finger Theme (match webpage.h cyan/teal) ───────────────────
+// RGB565 ≈ HTML: #0b1220 bg, #0f172a topbar, #132337 card,
+//                #38bdf8 cyan, #0e7490 teal, #a5e1ec teal-light
+#define COL_BG        0x0884   // #0b1220
+#define COL_SIDEBAR   0x3DFF   // #38bdf8 cyan
+#define COL_PANEL     0x1106   // #132337 card
+#define COL_TOPBAR    0x08A5   // #0f172a
+#define COL_ACCENT    0x3DFF   // #38bdf8 cyan
+#define COL_ACCENT2   0x0BB2   // #0e7490 teal
+#define COL_ACCENT3   0xA71D   // #a5e1ec teal-light
+#define COL_BORDER    0x2A6F   // soft cyan border
+#define COL_TEXT      0xE75E   // #e2e8f0
+#define COL_DIM       0x9517   // #94a3b8
+#define COL_DIM2      0x63B1   // #64748b
+#define COL_DIM3      0x2126   // dark slate inset
+#define COL_OK        0x262B   // #22c55e green
+#define COL_OK_DARK   0x1306   // dark green panel
+#define COL_ERR       0xEA08   // #ef4444
+#define COL_ERR_DARK  0x5800   // dark red panel
+#define COL_WARN      0xF4E1   // #f59e0b
+#define COL_GOLD      0x3DFF   // cyan (ex-gold → brand cyan)
+#define SIDEBAR_W     4
 #define SCREEN_W 320
 #define SCREEN_H 240
 
 // ── Layout constants ──────────────────────────────────────────────
-#define TOPBAR_H    30
-#define FOOTER_Y    210
-#define FOOTER_H    30
-#define ICON_CY     82
-#define STATUS_Y    148
+#define TOPBAR_H    32
+#define FOOTER_Y    208
+#define FOOTER_H    32
+#define ICON_CY     88
+#define STATUS_Y    152
 #define RESULT_Y    145
 
 // ────────────────────────────────────────────────────────────────────
 //  LCD PRIMITIVES
 // ────────────────────────────────────────────────────────────────────
 void lcdSidebar() {
-  tft.fillRect(0, TOPBAR_H, SIDEBAR_W, FOOTER_Y - TOPBAR_H, COL_SIDEBAR);
+  tft.fillRect(0, TOPBAR_H, SIDEBAR_W, FOOTER_Y - TOPBAR_H, COL_ACCENT2);
+  tft.fillRect(SIDEBAR_W - 1, TOPBAR_H, 1, FOOTER_Y - TOPBAR_H, COL_ACCENT);
 }
 
 void lcdProgressBar(int x, int y, int w, int h, int pct, uint16_t fg) {
   tft.fillRoundRect(x, y, w, h, 4, COL_DIM3);
+  tft.drawRoundRect(x, y, w, h, 4, COL_BORDER);
   int fw = (w - 4) * pct / 100;
   if (fw > 0) tft.fillRoundRect(x + 2, y + 2, fw, h - 4, 3, fg);
 }
 
 void lcdDrawFingerprint(int cx, int cy, int s, uint16_t col, uint16_t ringCol) {
+  // outer glow rings (web-like cyan halo)
+  tft.drawCircle(cx, cy, 32 * s / 10, COL_DIM3);
   tft.drawCircle(cx, cy, 28 * s / 10, ringCol);
   tft.drawCircle(cx, cy, 26 * s / 10, ringCol);
   tft.drawCircle(cx, cy, 22 * s / 10, col);
@@ -194,8 +202,8 @@ void lcdDrawFingerprint(int cx, int cy, int s, uint16_t col, uint16_t ringCol) {
 void lcdBadgeCenter(int cy, const char *txt, uint16_t bg, uint16_t fg) {
   int tw = tft.textWidth(txt, 2);
   int bw = tw + 28;
-  tft.fillRoundRect(SCREEN_W / 2 - bw / 2, cy - 14, bw, 28, 10, bg);
-  tft.drawRoundRect(SCREEN_W / 2 - bw / 2, cy - 14, bw, 28, 10, fg);
+  tft.fillRoundRect(SCREEN_W / 2 - bw / 2, cy - 14, bw, 28, 12, bg);
+  tft.drawRoundRect(SCREEN_W / 2 - bw / 2, cy - 14, bw, 28, 12, fg);
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(fg, bg);
   tft.setTextSize(2);
@@ -203,9 +211,17 @@ void lcdBadgeCenter(int cy, const char *txt, uint16_t bg, uint16_t fg) {
 }
 
 void lcdCard(int y, int h, uint16_t col) {
-  tft.fillRoundRect(10, y, SCREEN_W - 20, h, 10, COL_PANEL);
-  tft.drawRoundRect(10, y, SCREEN_W - 20, h, 10, COL_DIM3);
-  tft.fillRect(12, y + 6, 3, h - 12, col);
+  tft.fillRoundRect(12, y, SCREEN_W - 24, h, 12, COL_PANEL);
+  tft.drawRoundRect(12, y, SCREEN_W - 24, h, 12, COL_BORDER);
+  tft.fillRoundRect(14, y + 8, 4, h - 16, 2, col);
+}
+
+void lcdBrandMark(int x, int y) {
+  // mini brand square like web .brand-mark
+  tft.fillRoundRect(x, y, 18, 18, 4, COL_ACCENT2);
+  tft.fillRoundRect(x + 1, y + 1, 16, 16, 3, COL_ACCENT);
+  tft.drawCircle(x + 9, y + 9, 5, COL_TOPBAR);
+  tft.drawCircle(x + 9, y + 9, 3, COL_TOPBAR);
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -213,29 +229,36 @@ void lcdCard(int y, int h, uint16_t col) {
 // ────────────────────────────────────────────────────────────────────
 void lcdDrawTopbar() {
   tft.fillRect(0, 0, SCREEN_W, TOPBAR_H, COL_TOPBAR);
-  tft.fillRect(0, TOPBAR_H - 2, SCREEN_W, 2, COL_ACCENT);
+  tft.drawFastHLine(0, TOPBAR_H - 1, SCREEN_W, COL_BORDER);
+  lcdBrandMark(8, 7);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_ACCENT, COL_TOPBAR);
   tft.setTextSize(1);
-  tft.drawString("FPM10A", SIDEBAR_W + 6, 9);
-  tft.setTextDatum(TC_DATUM);
+  tft.drawString("PJTKI", 30, 6);
+  tft.setTextColor(COL_DIM, COL_TOPBAR);
+  tft.drawString("Finger", 30, 16);
+
+  // status pill center
+  const char *st = "IDLE";
+  uint16_t sc = COL_DIM;
   if (autoScan) {
-    if (scanSleeping) {
-      tft.setTextColor(COL_DIM, COL_TOPBAR);
-      tft.drawString("SLEEP", SCREEN_W / 2, 9);
-    } else {
-      tft.setTextColor(COL_OK, COL_TOPBAR);
-      tft.drawString("SCAN", SCREEN_W / 2, 9);
-    }
-  } else {
-    tft.setTextColor(COL_DIM, COL_TOPBAR);
-    tft.drawString("IDLE", SCREEN_W / 2, 9);
+    if (scanSleeping) { st = "SLEEP"; sc = COL_DIM2; }
+    else { st = "SCAN"; sc = COL_ACCENT; }
   }
+  int tw = tft.textWidth(st, 1);
+  int pw = tw + 16;
+  int px = SCREEN_W / 2 - pw / 2;
+  tft.fillRoundRect(px, 8, pw, 16, 8, COL_DIM3);
+  tft.drawRoundRect(px, 8, pw, 16, 8, sc);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(sc, COL_DIM3);
+  tft.drawString(st, SCREEN_W / 2, 16);
+
   char buf[12];
   snprintf(buf, sizeof(buf), "%d FP", finger.templateCount);
   tft.setTextDatum(TR_DATUM);
-  tft.setTextColor(COL_GOLD, COL_TOPBAR);
-  tft.drawString(buf, SCREEN_W - 8, 9);
+  tft.setTextColor(COL_ACCENT3, COL_TOPBAR);
+  tft.drawString(buf, SCREEN_W - 8, 12);
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -243,31 +266,35 @@ void lcdDrawTopbar() {
 // ────────────────────────────────────────────────────────────────────
 void lcdDrawFooter() {
   tft.fillRect(0, FOOTER_Y, SCREEN_W, FOOTER_H, COL_TOPBAR);
-  tft.fillRect(0, FOOTER_Y, SCREEN_W, 2, COL_ACCENT2);
+  tft.drawFastHLine(0, FOOTER_Y, SCREEN_W, COL_BORDER);
   tft.setTextDatum(TL_DATUM);
   tft.setTextSize(1);
 
   if (wifiConnected) {
-    tft.setTextColor(COL_OK, COL_TOPBAR);
-    tft.drawString(staSSID, SIDEBAR_W + 6, FOOTER_Y + 5);
+    tft.fillCircle(SIDEBAR_W + 10, FOOTER_Y + 10, 3, COL_OK);
+    tft.setTextColor(COL_TEXT, COL_TOPBAR);
+    tft.drawString(staSSID, SIDEBAR_W + 18, FOOTER_Y + 5);
     tft.setTextColor(COL_DIM2, COL_TOPBAR);
-    tft.drawString(staIP, SIDEBAR_W + 6, FOOTER_Y + 16);
+    tft.drawString(staIP, SIDEBAR_W + 18, FOOTER_Y + 17);
   } else {
+    tft.fillCircle(SIDEBAR_W + 10, FOOTER_Y + 10, 3, COL_WARN);
     tft.setTextColor(COL_WARN, COL_TOPBAR);
-    tft.drawString("AP:" AP_SSID, SIDEBAR_W + 6, FOOTER_Y + 5);
+    tft.drawString("AP:" AP_SSID, SIDEBAR_W + 18, FOOTER_Y + 5);
     tft.setTextColor(COL_DIM2, COL_TOPBAR);
-    tft.drawString("192.168.4.1", SIDEBAR_W + 6, FOOTER_Y + 16);
+    tft.drawString("192.168.4.1", SIDEBAR_W + 18, FOOTER_Y + 17);
   }
 
   tft.setTextDatum(TR_DATUM);
   char buf[20];
   snprintf(buf, sizeof(buf), "S:%d", finger.security_level);
+  tft.setTextColor(COL_DIM, COL_TOPBAR);
   tft.drawString(buf, SCREEN_W - 8, FOOTER_Y + 5);
+  tft.setTextColor(COL_ACCENT3, COL_TOPBAR);
   if (timeClient.isTimeSet()) {
     String t = timeClient.getFormattedTime();
-    tft.drawString(t, SCREEN_W - 8, FOOTER_Y + 16);
+    tft.drawString(t, SCREEN_W - 8, FOOTER_Y + 17);
   } else {
-    tft.drawString("--:--:--", SCREEN_W - 8, FOOTER_Y + 16);
+    tft.drawString("--:--:--", SCREEN_W - 8, FOOTER_Y + 17);
   }
 }
 
@@ -276,22 +303,23 @@ void lcdDrawFooter() {
 // ────────────────────────────────────────────────────────────────────
 void lcdShowBoot() {
   tft.fillScreen(COL_BG);
-  lcdSidebar();
-  tft.drawFastHLine(40, 105, SCREEN_W - 80, COL_ACCENT2);
-  tft.drawFastHLine(40, 107, SCREEN_W - 80, COL_ACCENT2);
-  lcdDrawFingerprint(SCREEN_W / 2, 55, 18, COL_ACCENT3, COL_ACCENT2);
+  // soft teal band behind icon
+  tft.fillRoundRect(40, 18, SCREEN_W - 80, 78, 14, COL_PANEL);
+  tft.drawRoundRect(40, 18, SCREEN_W - 80, 78, 14, COL_BORDER);
+  lcdDrawFingerprint(SCREEN_W / 2, 55, 16, COL_ACCENT, COL_ACCENT2);
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(COL_ACCENT, COL_BG);
   tft.setTextSize(2);
-  tft.drawString("FPM10A", SCREEN_W / 2, 112);
+  tft.drawString("PJTKI Finger", SCREEN_W / 2, 112);
   tft.setTextColor(COL_DIM, COL_BG);
   tft.setTextSize(1);
-  tft.drawString("Attendance System", SCREEN_W / 2, 135);
-  lcdProgressBar(50, 158, SCREEN_W - 100, 8, 0, COL_ACCENT);
+  tft.drawString("Attendance System", SCREEN_W / 2, 134);
+  tft.drawFastHLine(70, 148, SCREEN_W - 140, COL_BORDER);
+  lcdProgressBar(50, 162, SCREEN_W - 100, 10, 0, COL_ACCENT);
 }
 
 void lcdProgress(int pct) {
-  lcdProgressBar(50, 158, SCREEN_W - 100, 8, pct, COL_ACCENT);
+  lcdProgressBar(50, 162, SCREEN_W - 100, 10, pct, COL_ACCENT);
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -301,11 +329,22 @@ void lcdShowIdle() {
   tft.fillScreen(COL_BG);
   lcdSidebar();
   lcdDrawTopbar();
-  lcdDrawFingerprint(SCREEN_W / 2, ICON_CY, 20, COL_ACCENT2, COL_DIM3);
+
+  // hero card
+  tft.fillRoundRect(16, 44, SCREEN_W - 32, 148, 14, COL_PANEL);
+  tft.drawRoundRect(16, 44, SCREEN_W - 32, 148, 14, COL_BORDER);
+  tft.fillRoundRect(16, 44, SCREEN_W - 32, 6, 3, COL_ACCENT2);
+  tft.fillRect(16, 47, SCREEN_W - 32, 3, COL_ACCENT);
+
+  lcdDrawFingerprint(SCREEN_W / 2, ICON_CY, 18, COL_ACCENT, COL_ACCENT2);
+
   tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(COL_DIM, COL_BG);
+  tft.setTextColor(COL_TEXT, COL_PANEL);
   tft.setTextSize(1);
-  tft.drawString(autoScan ? "Scan mode" : "Touch sensor", SCREEN_W / 2, STATUS_Y);
+  tft.drawString(autoScan ? "Siap memindai sidik jari" : "Mode idle — aktifkan scan", SCREEN_W / 2, STATUS_Y - 4);
+  tft.setTextColor(COL_DIM2, COL_PANEL);
+  tft.drawString(autoScan ? "Tempelkan jari ke sensor" : "Buka web UI untuk enroll", SCREEN_W / 2, STATUS_Y + 12);
+
   lcdDrawFooter();
 }
 
@@ -315,12 +354,14 @@ void lcdShowIdle() {
 void lcdShowScanning() {
   tft.fillRect(0, TOPBAR_H + 1, SCREEN_W, FOOTER_Y - TOPBAR_H - 1, COL_BG);
   lcdSidebar();
-  lcdDrawFingerprint(SCREEN_W / 2, ICON_CY, 20, COL_ACCENT, COL_ACCENT2);
-  lcdBadgeCenter(STATUS_Y, "SCANNING", COL_ACCENT2, COL_ACCENT);
+  tft.fillRoundRect(16, 44, SCREEN_W - 32, 148, 14, COL_PANEL);
+  tft.drawRoundRect(16, 44, SCREEN_W - 32, 148, 14, COL_ACCENT);
+  lcdDrawFingerprint(SCREEN_W / 2, ICON_CY - 6, 20, COL_ACCENT, COL_ACCENT3);
+  lcdBadgeCenter(STATUS_Y - 6, "SCANNING", COL_ACCENT2, COL_ACCENT3);
   tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(COL_DIM, COL_BG);
+  tft.setTextColor(COL_DIM, COL_PANEL);
   tft.setTextSize(1);
-  tft.drawString("Analyzing...", SCREEN_W / 2, STATUS_Y + 25);
+  tft.drawString("Menganalisis sidik jari...", SCREEN_W / 2, STATUS_Y + 22);
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -329,51 +370,52 @@ void lcdShowScanning() {
 void lcdShowMatch(int id, int conf, const char *name) {
   tft.fillRect(0, TOPBAR_H + 1, SCREEN_W, FOOTER_Y - TOPBAR_H - 1, COL_BG);
   lcdSidebar();
-  lcdCard(45, 148, COL_OK);
-  tft.fillCircle(SCREEN_W / 2, 72, 15, COL_OK);
-  tft.drawLine(SCREEN_W / 2 - 9, 72, SCREEN_W / 2 - 3, 80, COL_BG);
-  tft.drawLine(SCREEN_W / 2 - 3, 80, SCREEN_W / 2 + 8, 64, COL_BG);
-  tft.drawLine(SCREEN_W / 2 - 8, 72, SCREEN_W / 2 - 2, 80, COL_BG);
-  tft.drawLine(SCREEN_W / 2 - 2, 80, SCREEN_W / 2 + 9, 65, COL_BG);
-  lcdBadgeCenter(100, "MATCH", COL_OK, COL_BG);
-  char buf[20];
+  lcdCard(42, 152, COL_OK);
+  tft.fillCircle(SCREEN_W / 2, 70, 16, COL_OK);
+  tft.drawCircle(SCREEN_W / 2, 70, 18, COL_OK);
+  tft.drawLine(SCREEN_W / 2 - 9, 70, SCREEN_W / 2 - 3, 78, COL_BG);
+  tft.drawLine(SCREEN_W / 2 - 3, 78, SCREEN_W / 2 + 8, 62, COL_BG);
+  tft.drawLine(SCREEN_W / 2 - 8, 70, SCREEN_W / 2 - 2, 78, COL_BG);
+  tft.drawLine(SCREEN_W / 2 - 2, 78, SCREEN_W / 2 + 9, 63, COL_BG);
+  lcdBadgeCenter(98, "MATCH", COL_OK_DARK, COL_OK);
+  char buf[24];
   tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_WHITE, COL_PANEL);
+  tft.setTextColor(COL_TEXT, COL_PANEL);
   tft.setTextSize(2);
-  snprintf(buf, sizeof(buf), "ID: %d", id);
+  snprintf(buf, sizeof(buf), "ID %d", id);
   tft.drawString(buf, SCREEN_W / 2, 122);
   if (name && name[0]) {
     tft.setTextSize(1);
     tft.setTextColor(COL_ACCENT3, COL_PANEL);
-    tft.drawString(name, SCREEN_W / 2, 143);
+    tft.drawString(name, SCREEN_W / 2, 142);
   }
   int confPct = conf * 100 / 256;
-  lcdProgressBar(50, 162, SCREEN_W - 100, 8, confPct, COL_OK);
-  snprintf(buf, sizeof(buf), "%d%%", confPct);
+  lcdProgressBar(40, 158, SCREEN_W - 80, 10, confPct, COL_OK);
+  snprintf(buf, sizeof(buf), "Confidence %d%%", confPct);
   tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(COL_OK, COL_BG);
+  tft.setTextColor(COL_OK, COL_PANEL);
   tft.setTextSize(1);
-  tft.drawString(buf, SCREEN_W / 2, 175);
+  tft.drawString(buf, SCREEN_W / 2, 178);
   lcdDrawTopbar();
   lcdDrawFooter();
 }
 
 void lcdShowAttendanceStatus(const char *status) {
-  tft.fillRect(20, 178, SCREEN_W - 40, 12, COL_PANEL);
+  tft.fillRoundRect(28, 176, SCREEN_W - 56, 14, 4, COL_DIM3);
   tft.setTextDatum(TC_DATUM);
   tft.setTextSize(1);
   if (strcmp(status, "checkin") == 0) {
-    tft.setTextColor(COL_OK, COL_PANEL);
-    tft.drawString("CHECK IN", SCREEN_W / 2, 184);
+    tft.setTextColor(COL_OK, COL_DIM3);
+    tft.drawString("CHECK IN", SCREEN_W / 2, 183);
   } else if (strcmp(status, "checkout") == 0) {
-    tft.setTextColor(COL_ACCENT, COL_PANEL);
-    tft.drawString("CHECK OUT", SCREEN_W / 2, 184);
+    tft.setTextColor(COL_ACCENT, COL_DIM3);
+    tft.drawString("CHECK OUT", SCREEN_W / 2, 183);
   } else if (strcmp(status, "ignored") == 0) {
-    tft.setTextColor(COL_WARN, COL_PANEL);
-    tft.drawString("ALREADY DONE", SCREEN_W / 2, 184);
+    tft.setTextColor(COL_WARN, COL_DIM3);
+    tft.drawString("SUDAH ABSEN", SCREEN_W / 2, 183);
   } else {
-    tft.setTextColor(COL_ERR, COL_PANEL);
-    tft.drawString("FAILED", SCREEN_W / 2, 184);
+    tft.setTextColor(COL_ERR, COL_DIM3);
+    tft.drawString("GAGAL KIRIM", SCREEN_W / 2, 183);
   }
 }
 
@@ -383,14 +425,16 @@ void lcdShowAttendanceStatus(const char *status) {
 void lcdShowNoMatch() {
   tft.fillRect(0, TOPBAR_H + 1, SCREEN_W, FOOTER_Y - TOPBAR_H - 1, COL_BG);
   lcdSidebar();
-  lcdCard(55, 120, COL_ERR);
-  tft.fillCircle(SCREEN_W / 2, 80, 14, COL_ERR);
-  tft.drawLine(SCREEN_W / 2 - 6, 80, SCREEN_W / 2 + 6, 80, COL_BG);
-  lcdBadgeCenter(115, "NO MATCH", COL_ERR, COL_BG);
+  lcdCard(52, 128, COL_ERR);
+  tft.fillCircle(SCREEN_W / 2, 78, 15, COL_ERR);
+  tft.drawCircle(SCREEN_W / 2, 78, 17, COL_ERR);
+  tft.drawLine(SCREEN_W / 2 - 7, 78, SCREEN_W / 2 + 7, 78, COL_BG);
+  tft.drawLine(SCREEN_W / 2 - 6, 78, SCREEN_W / 2 + 6, 78, COL_BG);
+  lcdBadgeCenter(112, "NO MATCH", COL_ERR_DARK, COL_ERR);
   tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(COL_WARN, COL_PANEL);
+  tft.setTextColor(COL_DIM, COL_PANEL);
   tft.setTextSize(1);
-  tft.drawString("Unregistered finger", SCREEN_W / 2, 148);
+  tft.drawString("Sidik jari belum terdaftar", SCREEN_W / 2, 148);
   lcdDrawTopbar();
   lcdDrawFooter();
 }
@@ -401,15 +445,15 @@ void lcdShowNoMatch() {
 void lcdShowSensorErr() {
   tft.fillRect(0, TOPBAR_H + 1, SCREEN_W, FOOTER_Y - TOPBAR_H - 1, COL_BG);
   lcdSidebar();
-  lcdCard(65, 100, COL_ERR);
+  lcdCard(58, 110, COL_ERR);
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(COL_ERR, COL_PANEL);
   tft.setTextSize(2);
-  tft.drawString("SENSOR", SCREEN_W / 2, 90);
-  tft.drawString("ERROR", SCREEN_W / 2, 110);
-  tft.setTextColor(COL_WARN, COL_PANEL);
+  tft.drawString("SENSOR", SCREEN_W / 2, 88);
+  tft.drawString("ERROR", SCREEN_W / 2, 112);
+  tft.setTextColor(COL_DIM, COL_PANEL);
   tft.setTextSize(1);
-  tft.drawString("Check connection", SCREEN_W / 2, 140);
+  tft.drawString("Periksa kabel & daya", SCREEN_W / 2, 140);
   lcdDrawTopbar();
   lcdDrawFooter();
 }
@@ -421,46 +465,54 @@ void lcdShowEnrollTitle(uint8_t id) {
   tft.fillScreen(COL_BG);
   lcdSidebar();
   tft.fillRect(0, 0, SCREEN_W, TOPBAR_H, COL_TOPBAR);
-  tft.fillRect(0, TOPBAR_H - 2, SCREEN_W, 2, COL_ACCENT);
-  tft.setTextDatum(TC_DATUM);
+  tft.drawFastHLine(0, TOPBAR_H - 1, SCREEN_W, COL_BORDER);
+  lcdBrandMark(8, 7);
+  tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_ACCENT, COL_TOPBAR);
-  tft.setTextSize(2);
-  char hdr[16];
-  snprintf(hdr, sizeof(hdr), "ENROLL ID:%d", id);
-  tft.drawString(hdr, SCREEN_W / 2, 9);
+  tft.setTextSize(1);
+  tft.drawString("ENROLL", 30, 6);
+  char hdr[20];
+  snprintf(hdr, sizeof(hdr), "Slot ID %d", id);
+  tft.setTextColor(COL_DIM, COL_TOPBAR);
+  tft.drawString(hdr, 30, 16);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(COL_ACCENT3, COL_TOPBAR);
+  tft.drawString("PJTKI", SCREEN_W - 8, 12);
 }
 
 void lcdEnrollStep(const char *step, int pct, const char *detail, uint16_t col) {
-  tft.fillRect(0, TOPBAR_H + 1, SCREEN_W, 100, COL_BG);
+  tft.fillRect(0, TOPBAR_H + 1, SCREEN_W, 110, COL_BG);
   lcdSidebar();
+  tft.fillRoundRect(16, TOPBAR_H + 8, SCREEN_W - 32, 96, 12, COL_PANEL);
+  tft.drawRoundRect(16, TOPBAR_H + 8, SCREEN_W - 32, 96, 12, COL_BORDER);
   tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(col, COL_BG);
+  tft.setTextColor(col, COL_PANEL);
   tft.setTextSize(2);
-  tft.drawString(step, SCREEN_W / 2, 55);
-  if (pct >= 0) lcdProgressBar(40, 85, SCREEN_W - 80, 8, pct, col);
+  tft.drawString(step, SCREEN_W / 2, TOPBAR_H + 36);
+  if (pct >= 0) lcdProgressBar(40, TOPBAR_H + 58, SCREEN_W - 80, 10, pct, col);
   if (detail) {
-    tft.setTextColor(COL_DIM, COL_BG);
+    tft.setTextColor(COL_DIM, COL_PANEL);
     tft.setTextSize(1);
-    tft.drawString(detail, SCREEN_W / 2, 105);
+    tft.drawString(detail, SCREEN_W / 2, TOPBAR_H + 84);
   }
 }
 
 void lcdEnrollOk(const char *msg) {
-  tft.fillRoundRect(30, 125, SCREEN_W - 60, 40, 10, COL_OK_DARK);
-  tft.drawRoundRect(30, 125, SCREEN_W - 60, 40, 10, COL_OK);
+  tft.fillRoundRect(28, 128, SCREEN_W - 56, 42, 12, COL_OK_DARK);
+  tft.drawRoundRect(28, 128, SCREEN_W - 56, 42, 12, COL_OK);
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(COL_OK, COL_OK_DARK);
   tft.setTextSize(2);
-  tft.drawString(msg, SCREEN_W / 2, 143);
+  tft.drawString(msg, SCREEN_W / 2, 149);
 }
 
 void lcdEnrollErr(const char *msg) {
-  tft.fillRoundRect(30, 125, SCREEN_W - 60, 40, 10, COL_ERR_DARK);
-  tft.drawRoundRect(30, 125, SCREEN_W - 60, 40, 10, COL_ERR);
+  tft.fillRoundRect(28, 128, SCREEN_W - 56, 42, 12, COL_ERR_DARK);
+  tft.drawRoundRect(28, 128, SCREEN_W - 56, 42, 12, COL_ERR);
   tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_WHITE, COL_ERR_DARK);
+  tft.setTextColor(COL_TEXT, COL_ERR_DARK);
   tft.setTextSize(2);
-  tft.drawString(msg, SCREEN_W / 2, 143);
+  tft.drawString(msg, SCREEN_W / 2, 149);
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -694,6 +746,7 @@ void settingsLoad() {
   strncpy(appSettings.apiBaseUrl, doc["apiBaseUrl"] | "", 127);
   strncpy(appSettings.kodeCabang, doc["kode_cabang"] | "", 15);
   strncpy(appSettings.deviceId, doc["device_id"] | "", 31);
+  strncpy(appSettings.apiKey, doc["api_key"] | "", 64);
 }
 
 void settingsSave() {
@@ -701,6 +754,7 @@ void settingsSave() {
   doc["apiBaseUrl"] = appSettings.apiBaseUrl;
   doc["kode_cabang"] = appSettings.kodeCabang;
   doc["device_id"] = appSettings.deviceId;
+  doc["api_key"] = appSettings.apiKey;
   File f = LittleFS.open(SETTINGS_FILENAME, "w");
   if (f) { serializeJson(doc, f); f.close(); }
 }
@@ -745,6 +799,7 @@ String postAttendance(const char *employeeId) {
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.begin(*client, url);
   http.addHeader("Content-Type", "application/json");
+  if (appSettings.apiKey[0]) http.addHeader("X-Device-Key", appSettings.apiKey);
   int code = http.POST(json);
   String resp = "";
   if (code > 0) {
@@ -789,6 +844,7 @@ String postRegister(const char *employeeId, uint8_t fingerId, const char *templa
   http.setTimeout(10000);
   http.begin(*client, url);
   http.addHeader("Content-Type", "application/json");
+  if (appSettings.apiKey[0]) http.addHeader("X-Device-Key", appSettings.apiKey);
   int code = http.POST(json);
   String resp = "";
   if (code > 0) {
@@ -1356,7 +1412,8 @@ void handleSettingsGet() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   String json = "{\"apiBaseUrl\":\"" + String(appSettings.apiBaseUrl) + "\"";
   json += ",\"kode_cabang\":\"" + String(appSettings.kodeCabang) + "\"";
-  json += ",\"device_id\":\"" + String(appSettings.deviceId) + "\"}";
+  json += ",\"device_id\":\"" + String(appSettings.deviceId) + "\"";
+  json += ",\"api_key\":\"" + String(appSettings.apiKey) + "\"}";
   server.send(200, "application/json", json);
 }
 
@@ -1372,6 +1429,7 @@ void handleSettingsSave() {
   if (doc.containsKey("apiBaseUrl")) strncpy(appSettings.apiBaseUrl, doc["apiBaseUrl"] | "", 127);
   if (doc.containsKey("kode_cabang")) strncpy(appSettings.kodeCabang, doc["kode_cabang"] | "", 15);
   if (doc.containsKey("device_id")) strncpy(appSettings.deviceId, doc["device_id"] | "", 31);
+  if (doc.containsKey("api_key")) strncpy(appSettings.apiKey, doc["api_key"] | "", 64);
   settingsSave();
   server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -1408,6 +1466,7 @@ String apiProxyGet(const char *path, int &httpCode) {
     delete client;
     return "";
   }
+  if (appSettings.apiKey[0]) http.addHeader("X-Device-Key", appSettings.apiKey);
   httpCode = http.GET();
   Serial.print("[API] HTTP code: "); Serial.println(httpCode);
   String resp = "";
@@ -1448,6 +1507,7 @@ String apiProxyPost(const char *path, const String &body, int &httpCode) {
     return "";
   }
   http.addHeader("Content-Type", "application/json");
+  if (appSettings.apiKey[0]) http.addHeader("X-Device-Key", appSettings.apiKey);
   httpCode = http.POST(body);
   String resp = "";
   if (httpCode > 0) resp = http.getString();
@@ -2881,8 +2941,8 @@ void setup() {
     lcdShowIdle();
   } else {
     tft.fillScreen(COL_BG);
-    tft.fillRect(0, 0, SCREEN_W, TOPBAR_H, COL_WARN);
-    tft.drawFastHLine(0, TOPBAR_H, SCREEN_W, COL_WARN);
+    tft.fillRect(0, 0, SCREEN_W, TOPBAR_H, COL_TOPBAR);
+    tft.drawFastHLine(0, TOPBAR_H - 1, SCREEN_W, COL_WARN);
     tft.setTextDatum(TC_DATUM);
     tft.setTextColor(COL_WARN, COL_BG);
     tft.setTextSize(2);

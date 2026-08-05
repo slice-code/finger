@@ -263,6 +263,7 @@ border:1.5px solid var(--border);border-radius:10px;margin-bottom:6px;cursor:poi
     <label>API Server URL</label><input id="sapi" placeholder="http://192.168.1.15:3004">
     <label>Kode Cabang</label><input id="scab" placeholder="CKS">
     <label>Device ID</label><input id="sdev" placeholder="arduino-001">
+    <label>API Key (X-Device-Key)</label><input id="skey" type="password" placeholder="Isi key dari server PJTKI">
     <button class="btn btn-c" onclick="saveSettings()">Simpan Setelan</button>
   </div>
   <div class="card"><h3>Status</h3>
@@ -513,6 +514,7 @@ api('/api/settings').then(d=>{
 document.getElementById('sapi').value=d.apiBaseUrl||'';
 document.getElementById('scab').value=d.kode_cabang||'';
 document.getElementById('sdev').value=d.device_id||'';
+document.getElementById('skey').value=d.api_key||'';
 }).catch(()=>{})
 updStatus()}
 
@@ -520,8 +522,9 @@ function saveSettings(){
 var u=document.getElementById('sapi').value.trim();
 var c=document.getElementById('scab').value.trim();
 var dv=document.getElementById('sdev').value.trim();
+var ak=document.getElementById('skey').value.trim();
 if(!u){alert('API URL wajib diisi');return}
-api('/api/settings','POST',{apiBaseUrl:u,kode_cabang:c,device_id:dv}).then(d=>{
+api('/api/settings','POST',{apiBaseUrl:u,kode_cabang:c,device_id:dv,api_key:ak}).then(d=>{
 if(d.ok){alert('Setelan tersimpan!');}
 }).catch(()=>alert('Gagal menyimpan'))}
 
