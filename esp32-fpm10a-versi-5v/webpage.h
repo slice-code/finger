@@ -7,65 +7,157 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FPM10A Console</title>
+<title>PJTKI Finger</title>
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap');
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#0a0e14;--card:#141b24;--border:#1e2a38;--cyan:#00e5ff;--green:#00e676;--red:#ff1744;--yellow:#ffd600;--dim:#6b7280;--text:#e2e8f0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
-.topbar{background:#0d1520;border-bottom:1px solid var(--border);padding:12px 16px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
-.topbar h1{font-size:18px;color:var(--cyan)}
-.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:12px;font-size:11px;background:var(--card);border:1px solid var(--border)}
-.dot{width:7px;height:7px;border-radius:50%}
-.dot-g{background:var(--green)}.dot-r{background:var(--red)}.dot-y{background:var(--yellow)}
-.tabs{display:flex;background:var(--card);border-bottom:1px solid var(--border);overflow-x:auto}
-.tab{flex:1;padding:12px 8px;text-align:center;cursor:pointer;font-size:13px;color:var(--dim);border-bottom:2px solid transparent;transition:.2s;white-space:nowrap}
-.tab:hover{color:var(--text)}.tab.on{color:var(--cyan);border-color:var(--cyan)}
-.page{display:none;padding:16px;max-width:600px;margin:0 auto}.page.on{display:block}
-.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:12px}
-.card h3{font-size:13px;color:var(--dim);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px}
-.stat{font-size:28px;font-weight:700}
+:root{
+/* PJTKI layout.js — teal #0e7490 + cyan #38bdf8 + slate #0f172a */
+--bg:#0b1220;
+--bg2:#0f172a;
+--card:#132337;
+--border:rgba(56,189,248,.16);
+--border2:rgba(56,189,248,.28);
+--cyan:#38bdf8;
+--teal:#0e7490;
+--teal-light:#a5e1ec;
+--blue:#3b82f6;
+--green:#22c55e;
+--red:#ef4444;
+--yellow:#f59e0b;
+--dim:#94a3b8;
+--dim2:#64748b;
+--text:#e2e8f0;
+--radius:14px;
+}
+html,body{min-height:100%}
+body{
+font-family:'Outfit',system-ui,sans-serif;
+background:
+radial-gradient(1000px 420px at 8% -8%,rgba(14,116,144,.28),transparent 55%),
+radial-gradient(800px 380px at 100% 0%,rgba(56,189,248,.12),transparent 45%),
+linear-gradient(180deg,#0b1220 0%,#0f172a 50%,#0b1424 100%);
+color:var(--text);-webkit-font-smoothing:antialiased;
+}
+.shell{max-width:680px;margin:0 auto;padding-bottom:24px}
+.topbar{
+background:rgba(15,23,42,.88);backdrop-filter:blur(12px);
+border-bottom:1px solid var(--border);
+padding:14px 16px;display:flex;align-items:center;justify-content:space-between;
+position:sticky;top:0;z-index:100;gap:10px;
+}
+.brand{display:flex;align-items:center;gap:10px}
+.brand-mark{
+width:40px;height:40px;border-radius:12px;
+background:linear-gradient(145deg,#38bdf8,#0e7490);
+box-shadow:0 8px 20px rgba(14,116,144,.4),inset 0 1px 0 rgba(255,255,255,.25);
+display:grid;place-items:center;
+}
+.brand-mark svg{width:22px;height:22px}
+.topbar h1{font-size:18px;font-weight:800;letter-spacing:-.3px;
+background:linear-gradient(135deg,var(--cyan),var(--teal-light));
+-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.topbar .sub{font-size:11px;color:var(--dim);margin-top:2px;font-weight:500}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:999px;font-size:11px;font-weight:600;
+background:rgba(19,35,55,.9);border:1px solid var(--border)}
+.dot{width:8px;height:8px;border-radius:50%}
+.dot-g{background:var(--green);box-shadow:0 0 8px rgba(34,197,94,.55)}
+.dot-r{background:var(--red);box-shadow:0 0 8px rgba(239,68,68,.45)}
+.dot-y{background:var(--yellow);box-shadow:0 0 8px rgba(245,158,11,.45)}
+.tabs{display:flex;gap:4px;overflow-x:auto;padding:8px 12px 10px;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{flex:0 0 auto;min-width:72px;padding:10px 12px;text-align:center;cursor:pointer;font-size:12px;font-weight:700;
+color:var(--dim2);border-radius:999px;border:1px solid transparent;transition:.2s;white-space:nowrap}
+.tab:hover{color:var(--text);background:rgba(56,189,248,.06)}
+.tab.on{color:#0f172a;background:linear-gradient(135deg,#67e8f9,#0e7490);box-shadow:0 8px 18px rgba(14,116,144,.3)}
+.page{display:none;padding:0 14px;animation:rise .25s ease}.page.on{display:block}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.hero{margin:4px 0 12px;padding:18px 16px;border-radius:18px;position:relative;overflow:hidden;
+background:linear-gradient(135deg,rgba(14,116,144,.92),rgba(15,23,42,.95));
+border:1px solid var(--border2);box-shadow:0 14px 36px rgba(0,0,0,.28)}
+.hero::after{content:'';position:absolute;right:-24px;top:-30px;width:140px;height:140px;border-radius:50%;
+border:14px solid rgba(56,189,248,.1);box-shadow:0 0 0 28px rgba(14,116,144,.07)}
+.hero-kicker{font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:var(--teal-light);margin-bottom:6px}
+.hero h2{font-size:22px;font-weight:800;letter-spacing:-.4px;line-height:1.2;max-width:16ch;position:relative;z-index:1}
+.hero .sub{margin-top:6px;color:rgba(226,232,240,.75);font-size:12px;line-height:1.45;max-width:36ch;position:relative;z-index:1}
+.card{background:linear-gradient(180deg,rgba(19,35,55,.95),rgba(15,23,42,.92));border:1px solid var(--border);
+border-radius:var(--radius);padding:16px;margin-bottom:12px;box-shadow:0 10px 24px rgba(0,0,0,.22)}
+.card h3{font-size:11px;font-weight:700;color:var(--dim);margin-bottom:12px;text-transform:uppercase;letter-spacing:.7px;
+display:flex;align-items:center;gap:8px}
+.card h3::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--cyan);box-shadow:0 0 0 3px rgba(56,189,248,.15)}
+.stat{font-size:28px;font-weight:800;letter-spacing:-1px}
 .stat-c{color:var(--cyan)}.stat-g{color:var(--green)}.stat-r{color:var(--red)}
-.btn{display:inline-flex;align-items:center;justify-content:center;padding:10px 20px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:.15s;width:100%;margin-top:8px}
-.btn-c{background:var(--cyan);color:#000}.btn-c:hover{filter:brightness(1.15)}
-.btn-g{background:var(--green);color:#000}.btn-g:hover{filter:brightness(1.15)}
-.btn-r{background:var(--red);color:#fff}.btn-r:hover{filter:brightness(1.15)}
-.btn-o{background:transparent;border:1px solid var(--border);color:var(--text)}.btn-o:hover{background:var(--border)}
-.btn:disabled{opacity:.4;cursor:not-allowed}
-input,select{width:100%;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;margin-top:6px;outline:none}
-input:focus,select:focus{border-color:var(--cyan)}
-label{font-size:13px;color:var(--dim);margin-top:10px;display:block}
-.scan-box{text-align:center;padding:30px 16px;border-radius:16px;border:2px solid var(--border);transition:.3s}
-.scan-box.active{border-color:var(--cyan);box-shadow:0 0 30px rgba(0,229,255,.15)}
-.scan-box.ok{border-color:var(--green);box-shadow:0 0 30px rgba(0,230,118,.2)}
-.scan-box.fail{border-color:var(--red);box-shadow:0 0 30px rgba(255,23,68,.2)}
-.scan-icon{font-size:48px;margin-bottom:12px;animation:pulse 1.5s infinite}
-@keyframes pulse{0%,100%{opacity:.6}50%{opacity:1}}
-.scan-badge{display:inline-block;padding:4px 14px;border-radius:16px;font-size:12px;font-weight:700;margin:8px 0}
-.badge-scan{background:rgba(0,229,255,.15);color:var(--cyan)}
-.badge-ok{background:rgba(0,230,118,.15);color:var(--green)}
-.badge-fail{background:rgba(255,23,68,.15);color:var(--red)}
-.badge-idle{background:rgba(107,114,128,.15);color:var(--dim)}
-.scan-name{font-size:20px;font-weight:700;margin:4px 0}
-.log{max-height:200px;overflow-y:auto;font-family:'SF Mono',monospace;font-size:11px;background:var(--bg);border-radius:8px;padding:8px;margin-top:8px}
-.log div{padding:2px 0;border-bottom:1px solid var(--border)}
-.log .t{color:var(--dim)}.log .ok{color:var(--green)}.log .er{color:var(--red)}.log .cy{color:var(--cyan)}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{text-align:left;padding:8px;color:var(--dim);border-bottom:1px solid var(--border);font-size:11px;text-transform:uppercase}
-td{padding:8px;border-bottom:1px solid var(--border)}
-.del-btn{background:none;border:none;color:var(--red);cursor:pointer;font-size:16px;padding:4px 8px}
-.empty-state{text-align:center;padding:40px;color:var(--dim)}
-.wifi-item{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-bottom:6px;cursor:pointer;transition:.15s}
-.wifi-item:hover{border-color:var(--cyan)}
-.wifi-item.selected{border-color:var(--cyan);background:rgba(0,229,255,.05)}
-.wifi-ssid{font-weight:600;font-size:14px}
-.wifi-signal{font-size:12px;color:var(--dim)}
+.btn{display:inline-flex;align-items:center;justify-content:center;padding:11px 18px;border:none;border-radius:12px;
+font-size:13px;font-weight:700;cursor:pointer;transition:.15s;width:100%;margin-top:8px;font-family:inherit}
+.btn:active{transform:scale(.98)}
+.btn-c{background:linear-gradient(135deg,#38bdf8,#0e7490);color:#0f172a;box-shadow:0 8px 20px rgba(14,116,144,.32)}
+.btn-c:hover{filter:brightness(1.06)}
+.btn-g{background:linear-gradient(135deg,#22d3ee,#0e7490);color:#0f172a}
+.btn-r{background:linear-gradient(135deg,#f87171,#dc2626);color:#fff}
+.btn-o{background:transparent;border:1.5px solid var(--border2);color:var(--text)}
+.btn-o:hover{background:rgba(56,189,248,.08);border-color:var(--cyan);color:var(--cyan)}
+.btn:disabled{opacity:.4;cursor:not-allowed;transform:none!important}
+input,select{width:100%;padding:11px 12px;background:rgba(11,18,32,.7);border:1.5px solid var(--border);
+border-radius:10px;color:var(--text);font-size:13px;margin-top:6px;outline:none;font-family:inherit}
+input:focus,select:focus{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(56,189,248,.15)}
+label{font-size:12px;color:var(--dim);margin-top:10px;display:block;font-weight:600}
+.scan-box{text-align:center;padding:28px 16px;border-radius:16px;border:2px solid var(--border);transition:.3s;
+background:rgba(11,18,32,.45)}
+.scan-box.active{border-color:rgba(56,189,248,.55);box-shadow:0 0 30px rgba(56,189,248,.15)}
+.scan-box.ok{border-color:rgba(34,197,94,.55);box-shadow:0 0 30px rgba(34,197,94,.15)}
+.scan-box.fail{border-color:rgba(239,68,68,.55);box-shadow:0 0 30px rgba(239,68,68,.15)}
+.scan-icon{font-size:48px;margin-bottom:12px}
+.scan-icon.ring,.scan-box.active .scan-icon{animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:.65;transform:scale(1)}50%{opacity:1;transform:scale(1.05)}}
+.scan-badge{display:inline-block;padding:4px 14px;border-radius:999px;font-size:11px;font-weight:700;margin:8px 0;letter-spacing:.4px}
+.badge-scan{background:rgba(56,189,248,.14);color:var(--cyan);border:1px solid rgba(56,189,248,.28)}
+.badge-ok{background:rgba(34,197,94,.14);color:var(--green);border:1px solid rgba(34,197,94,.28)}
+.badge-fail{background:rgba(239,68,68,.14);color:var(--red);border:1px solid rgba(239,68,68,.28)}
+.badge-idle{background:rgba(148,163,184,.12);color:var(--dim);border:1px solid rgba(148,163,184,.2)}
+.scan-name{font-size:18px;font-weight:700;margin:4px 0}
+.log{max-height:200px;overflow-y:auto;font-family:'IBM Plex Mono',ui-monospace,monospace;font-size:11px;
+background:rgba(11,18,32,.75);border:1px solid var(--border);border-radius:10px;padding:8px;margin-top:8px}
+.log div{padding:3px 4px;border-bottom:1px solid rgba(56,189,248,.06)}
+.log .t{color:var(--dim2)}.log .ok{color:var(--green)}.log .er{color:var(--red)}.log .cy{color:var(--cyan)}.log .wa{color:var(--yellow)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:9px 10px;color:var(--dim);border-bottom:1px solid var(--border);font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+td{padding:9px 10px;border-bottom:1px solid rgba(56,189,248,.07)}
+.del-btn{background:none;border:none;color:var(--red);cursor:pointer;font-size:16px;padding:4px 8px;border-radius:6px}
+.del-btn:hover{background:rgba(239,68,68,.12)}
+.empty-state{text-align:center;padding:36px;color:var(--dim)}
+.sync-row{display:flex;align-items:flex-start;gap:10px;padding:10px 12px;background:rgba(11,18,32,.55);
+border:1.5px solid var(--border);border-radius:10px;margin-bottom:6px}
+.sync-row input{width:auto;margin:2px 0 0;padding:0;accent-color:var(--cyan)}
+.sync-row .meta{flex:1;min-width:0}
+.sync-row .nm{font-weight:700;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sync-row .id{font-size:11px;color:var(--dim);font-family:'IBM Plex Mono',monospace;margin-top:2px}
+.sync-row .cab{font-size:10px;color:var(--cyan);font-weight:600;margin-top:3px}
+.sync-tools{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+.sync-tools .btn{width:auto;flex:1;min-width:120px;margin-top:0}
+.muted{font-size:13px;color:var(--dim);margin-bottom:8px;line-height:1.45}
+.wifi-item{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:rgba(11,18,32,.55);
+border:1.5px solid var(--border);border-radius:10px;margin-bottom:6px;cursor:pointer;transition:.15s}
+.wifi-item:hover,.wifi-item.selected{border-color:var(--cyan);background:rgba(56,189,248,.08)}
+.wifi-ssid{font-weight:700;font-size:13px}
+.wifi-signal{font-size:11px;color:var(--dim2)}
 .wifi-lock{color:var(--yellow);font-size:12px}
+.muted{font-size:12px;color:var(--dim);line-height:1.5;margin-bottom:10px}
+.foot{text-align:center;padding:16px;color:var(--dim2);font-size:11px}
 </style>
 </head>
 <body>
+<div class="shell">
 <div class="topbar">
-  <h1>FPM10A</h1>
-  <div style="display:flex;gap:6px">
+  <div class="brand">
+    <div class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M12 3c-1.2 2.2-1.8 3.8-1.8 5.4 0 1.7.9 2.8 2.1 2.8 1.4 0 2.2-1.3 2.2-3.1 0-1.6-.6-3.2-2.5-5.1Z" stroke="#0c4a6e" stroke-width="1.7"/><path d="M7.2 8.2c-.4 1.5-.5 2.7-.2 3.8.5 1.7 1.8 2.7 3.4 2.7" stroke="#0c4a6e" stroke-width="1.7" stroke-linecap="round"/><path d="M16.8 8.5c.5 1.5.6 2.7.2 3.9-.5 1.6-1.8 2.5-3.3 2.5" stroke="#0c4a6e" stroke-width="1.7" stroke-linecap="round"/><path d="M5.4 12.4c-.2 1.4 0 2.7.7 3.9 1 1.8 2.8 2.8 5 2.8" stroke="#0c4a6e" stroke-width="1.7" stroke-linecap="round"/><path d="M18.5 12.6c.3 1.4.1 2.7-.6 3.9-1 1.7-2.8 2.7-4.9 2.7" stroke="#0c4a6e" stroke-width="1.7" stroke-linecap="round"/><path d="M12 14.2v6.2" stroke="#0c4a6e" stroke-width="1.7" stroke-linecap="round"/></svg>
+    </div>
+    <div>
+      <h1>PJTKI Finger</h1>
+      <div class="sub">Absensi sidik jari BLK</div>
+    </div>
+  </div>
+  <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">
     <span class="pill"><span class="dot" id="sdot"></span><span id="stxt">OFFLINE</span></span>
     <span class="pill" id="tpill">0 templates</span>
   </div>
@@ -81,6 +173,11 @@ td{padding:8px;border-bottom:1px solid var(--border)}
 </div>
 
 <div class="page on" id="p-dash">
+  <div class="hero">
+    <div class="hero-kicker">Perangkat siap</div>
+    <h2>Daftarkan &amp; absenkan TKI dengan satu sentuhan</h2>
+    <p class="sub">Sensor FPM10A terhubung ke server PJTKI. Scan selalu aktif.</p>
+  </div>
   <div class="card"><h3>Status</h3>
     <div style="display:flex;gap:12px">
       <div style="flex:1"><div class="stat stat-c" id="dcnt">-</div><div style="font-size:12px;color:var(--dim)">Templates</div></div>
@@ -101,6 +198,7 @@ td{padding:8px;border-bottom:1px solid var(--border)}
 
 <div class="page" id="p-enroll">
   <div class="card"><h3>Daftar Sidik Jari</h3>
+    <p class="muted">Setelah berhasil, data ikut tersimpan ke server PJTKI via API register.</p>
     <label>Cabang</label>
     <select id="ebranch" onchange="loadEmpList(this.value)"><option value="">-- Pilih Cabang --</option></select>
     <label>Karyawan</label>
@@ -198,6 +296,21 @@ td{padding:8px;border-bottom:1px solid var(--border)}
 </div>
 
 <div class="page" id="p-cadangan">
+  <div class="card"><h3>Sinkron dari Server PJTKI</h3>
+    <p class="muted">Pilih anak (bisa lintas cabang) yang punya template hex di server, lalu tulis ke sensor. Yang sudah ada di device di-skip. Setelan API URL + WiFi STA wajib.</p>
+    <label>Filter cabang (kosong = semua)</label>
+    <select id="syncCabang"><option value="">— Semua cabang —</option></select>
+    <label>Cari nama / ID biodata</label>
+    <input id="syncQ" type="text" placeholder="Contoh: Siti atau CKSLBK-TW-0001" onkeydown="if(event.key==='Enter')loadServerTemplates()">
+    <div class="sync-tools">
+      <button class="btn btn-o" onclick="loadServerTemplates()">Muat Daftar</button>
+      <button class="btn btn-o" onclick="syncSelectAll(true)">Pilih Semua</button>
+      <button class="btn btn-o" onclick="syncSelectAll(false)">Batal Pilih</button>
+    </div>
+    <div id="syncList" style="margin-top:10px;max-height:280px;overflow-y:auto"></div>
+    <button class="btn btn-c" id="syncBtn" onclick="syncFromServer()" disabled>Sinkron yang Dipilih</button>
+    <div id="syncProg" style="margin-top:10px;text-align:center;color:var(--dim);font-size:13px"></div>
+  </div>
   <div class="card"><h3>Cadangan / Backup</h3>
     <p style="font-size:13px;color:var(--dim);margin-bottom:8px">
       Unduh data metadata sidik jari (nama + ID karyawan) sebagai file JSON.
@@ -226,7 +339,7 @@ var autoOn=false;
 function go(s){document.querySelectorAll('.page').forEach(p=>p.classList.remove('on'));
 document.getElementById('p-'+s).classList.add('on');
 document.querySelectorAll('.tab').forEach((t,i)=>{t.classList.toggle('on',['dash','enroll','data','wifi','setel','akun','cadangan'][i]===s)});
-if(s==='data')loadData();if(s==='wifi')loadWifiStatus();if(s==='setel')loadSettings();if(s==='akun')loadCred();if(s==='enroll')loadBranchList()}
+if(s==='data')loadData();if(s==='wifi')loadWifiStatus();if(s==='setel')loadSettings();if(s==='akun')loadCred();if(s==='enroll')loadBranchList();if(s==='cadangan'){loadSyncCabang();loadServerTemplates()}}
 function addLog(el,cls,txt){var d=document.getElementById(el);var m=document.createElement('div');
 m.innerHTML='<span class="t">'+new Date().toLocaleTimeString()+'</span> <span class="'+cls+'">'+txt+'</span>';
 d.prepend(m);if(d.children.length>50)d.lastChild.remove()}
@@ -442,6 +555,99 @@ if(d.ok){alert('Tersimpan! Rebooting...');}
 }).catch(()=>alert('Gagal menyimpan'))}
 
 // ── Backup / Restore ──
+
+var syncRows=[];
+function loadSyncCabang(){
+api('/api/branches').then(function(d){
+var sel=document.getElementById('syncCabang');
+if(!sel)return;
+var cur=sel.value||'';
+var opts='<option value="">— Semua cabang —</option>';
+var arr=Array.isArray(d)?d:(d.data||[]);
+arr.forEach(function(b){
+var k=b.kode_cabang||'';
+var n=b.nama_cabang||b.nama||k;
+if(!k)return;
+opts+='<option value="'+k+'">'+n+' ('+k+')</option>';
+});
+sel.innerHTML=opts;
+if(cur)sel.value=cur;
+}).catch(function(){})}
+function syncSelectedIds(){
+return Array.from(document.querySelectorAll('#syncList input.sync-cb:checked')).map(function(el){return el.value}).filter(Boolean)
+}
+function syncUpdateBtn(){
+var btn=document.getElementById('syncBtn');
+if(!btn)return;
+var n=syncSelectedIds().length;
+btn.disabled=!n;
+btn.textContent=n?('Sinkron yang Dipilih ('+n+')'):'Sinkron yang Dipilih';
+}
+function syncSelectAll(on){
+document.querySelectorAll('#syncList input.sync-cb').forEach(function(el){el.checked=!!on});
+syncUpdateBtn();
+}
+function renderSyncList(rows){
+syncRows=rows||[];
+var box=document.getElementById('syncList');
+if(!box)return;
+if(!syncRows.length){
+box.innerHTML='<div class="empty-state" style="padding:20px">Tidak ada template hex di server (filter/cabang).</div>';
+syncUpdateBtn();
+return}
+box.innerHTML=syncRows.map(function(r){
+var id=r.employee_id||'';
+var nm=r.nama||'(tanpa nama)';
+var cab=r.kode_cabang||'-';
+return '<label class="sync-row"><input class="sync-cb" type="checkbox" value="'+id+'" onchange="syncUpdateBtn()"><span class="meta"><div class="nm">'+nm+'</div><div class="id">'+id+'</div><div class="cab">Cabang: '+cab+'</div></span></label>';
+}).join('');
+syncUpdateBtn();
+}
+function loadServerTemplates(){
+var cab=(document.getElementById('syncCabang').value||'').trim();
+var q=(document.getElementById('syncQ').value||'').trim();
+var path='/api/server/templates?';
+if(cab)path+='kode_cabang='+encodeURIComponent(cab)+'&';
+if(q)path+='q='+encodeURIComponent(q)+'&';
+document.getElementById('syncProg').innerHTML='<span style="color:var(--cyan)">Memuat daftar...</span>';
+document.getElementById('syncList').innerHTML='';
+fetch(path).then(function(r){return r.json()}).then(function(d){
+if(!d.success&&d.ok===false){
+document.getElementById('syncProg').innerHTML='<span style="color:var(--red)">Gagal: '+(d.error||d.message||'load')+'</span>';
+return}
+var rows=d.data||[];
+document.getElementById('syncProg').innerHTML='<span style="color:var(--dim)">'+rows.length+' template siap sync</span>';
+renderSyncList(rows);
+addLog('rlog','cy','Muat daftar server: '+rows.length);
+}).catch(function(){
+document.getElementById('syncProg').innerHTML='<span style="color:var(--red)">Gagal muat daftar</span>';
+addLog('rlog','er','Gagal muat daftar server');
+})}
+function syncFromServer(){
+var ids=syncSelectedIds();
+if(!ids.length){alert('Pilih minimal 1 anak');return}
+if(ids.length>30){alert('Maksimal 30 per batch');return}
+if(!confirm('Sinkron '+ids.length+' template ke sensor?'))return;
+var btn=document.getElementById('syncBtn');
+btn.disabled=true;
+document.getElementById('syncProg').innerHTML='<span style="color:var(--cyan);font-weight:600">Menyinkronkan '+ids.length+'...</span>';
+addLog('rlog','cy','Sync selected: '+ids.length);
+api('/api/sync/from-server','POST',{employeeIds:ids}).then(function(d){
+syncUpdateBtn();
+if(!d.ok){
+document.getElementById('syncProg').innerHTML='<span style="color:var(--red)">Gagal: '+(d.error||'unknown')+'</span>';
+addLog('rlog','er','Sync gagal: '+(d.error||''));
+return}
+var msg='OK: '+d.restored+' ditulis, '+d.skipped+' skip, '+d.failed+' gagal'+(d.noHex?(', '+d.noHex+' tanpa hex'):'');
+document.getElementById('syncProg').innerHTML='<span style="color:var(--green);font-weight:700">'+msg+'</span>';
+addLog('rlog','ok',msg);
+updStatus();loadData();
+}).catch(function(){
+syncUpdateBtn();
+document.getElementById('syncProg').innerHTML='<span style="color:var(--red)">Error jaringan</span>';
+addLog('rlog','er','Sync network error');
+})}
+
 function downloadBackup(){
 window.location.href='/api/backup';
 addLog('rlog','cy','Mengunduh metadata...')}
@@ -531,6 +737,9 @@ else if(t==='waiting_finger_2')
 document.getElementById('eprog').innerHTML='<span style="color:var(--yellow)">Letakkan jari SAMA lagi...</span>';
 else if(t==='image_ok_step2')
 document.getElementById('eprog').innerHTML='<span style="color:var(--green)">Scan 2 OK | Membuat model...</span>';
+else if(t==='register_server'){
+var rs=(o.response&&o.response.status)||'error';
+addLog('elog2',rs==='ok'?'ok':'er','Server DB: '+(rs==='ok'||rs==='updated'?'tersimpan':'gagal sync'))}
 else if(t==='enrolled'){
 document.getElementById('eprog').innerHTML='<span style="color:var(--green)">Berhasil! ID: '+o.id+'</span>';
 document.getElementById('enrollBtn').disabled=false;
@@ -559,6 +768,13 @@ addLog('slog','er','Scan error: '+(o.step||'')+' code:'+(o.code||''));
 else if(t==='watchdog_reset'){
 addLog('elog','er','WATCHDOG: Device restart');
 updStatus()}
+else if(t==='sync_progress'){
+var st=o.status||'';
+document.getElementById('syncProg').innerHTML='Sync '+(o.employeeId||'')+': '+st;
+addLog('rlog',st==='restored'?'ok':'cy','Sync '+(o.employeeId||'')+' → '+st)}
+else if(t==='sync_complete'){
+addLog('rlog','ok','Sync selesai: '+(o.restored||0)+' ok, '+(o.skipped||0)+' skip, '+(o.failed||0)+' gagal');
+updStatus()}
 else if(t==='restore_progress')
 document.getElementById('rprog').innerHTML='Memeriksa ID:'+o.id+' '+(o.template?'<span style="color:var(--green)">ada template</span>':'<span style="color:var(--red)">tanpa template</span>');
 else if(t==='restore_complete'){
@@ -574,7 +790,11 @@ addLog('slog',cols[msg]||'t','Attendance: '+msg+(o.response?' '+JSON.stringify(o
 updStatus()}
 
 updStatus();setInterval(updStatus,5000);
+document.getElementById('ebranch').addEventListener('change',function(){loadEmpList(this.value);});
+
 </script>
+<div class="foot">PJTKI Finger · ESP32 + FPM10A</div>
+</div>
 </body>
 </html>
 )rawliteral";

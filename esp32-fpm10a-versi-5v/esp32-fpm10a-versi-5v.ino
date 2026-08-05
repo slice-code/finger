@@ -755,6 +755,53 @@ String postAttendance(const char *employeeId) {
   return resp;
 }
 
+
+// Register enroll ke server PJTKI (POST /api/finger/arduino/register)
+String postRegister(const char *employeeId, uint8_t fingerId, const char *templateHex) {
+  if (!appSettings.apiBaseUrl[0] || !employeeId || !employeeId[0]) return "";
+  if (WiFi.status() != WL_CONNECTED) return "";
+
+  String url = String(appSettings.apiBaseUrl) + "/api/finger/arduino/register";
+
+  DynamicJsonDocument body(1536);
+  body["employeeId"] = employeeId;
+  body["device_id"] = appSettings.deviceId;
+  body["kode_cabang"] = appSettings.kodeCabang;
+  body["finger_id"] = fingerId;
+  if (templateHex && templateHex[0]) body["templateHex"] = templateHex;
+
+  String json;
+  serializeJson(body, json);
+
+  bool isHttps = url.startsWith("https://");
+  WiFiClient *client;
+  WiFiClientSecure *wc = nullptr;
+  if (isHttps) {
+    wc = new WiFiClientSecure();
+    wc->setInsecure();
+    client = wc;
+  } else {
+    client = new WiFiClient();
+  }
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(10000);
+  http.begin(*client, url);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(json);
+  String resp = "";
+  if (code > 0) {
+    resp = http.getString();
+    Serial.printf("[API] register HTTP %d: %s\n", code, resp.c_str());
+  } else {
+    Serial.printf("[API] register fail code=%d\n", code);
+  }
+  http.end();
+  delete client;
+  return resp;
+}
+
 // ────────────────────────────────────────────────────────────────────
 //  WiFi Manager - Init (AP always on, STA if credentials exist)
 // ────────────────────────────────────────────────────────────────────
@@ -794,6 +841,14 @@ void wifiInit() {
 
   Serial.println("[WiFi] All saved networks failed, AP only");
 }
+
+
+bool getTemplateRaw(uint16_t id, uint8_t *buf);
+String toHex(const uint8_t *buf, size_t len);
+bool putTemplateRaw(uint16_t id, const uint8_t *buf);
+bool fromHex(const char *hex, uint8_t *buf, size_t maxLen);
+String apiProxyGet(const char *path, int &httpCode);
+String apiProxyPost(const char *path, const String &body, int &httpCode);
 
 // ────────────────────────────────────────────────────────────────────
 //  ENROLLMENT
@@ -891,6 +946,22 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
 
   dbAdd(id, name, empId);
 
+  if (wifiConnected && empId && empId[0]) {
+    uint8_t tplBuf[256];
+    String hexStr = "";
+    if (getTemplateRaw(id, tplBuf)) {
+      hexStr = toHex(tplBuf, 256);
+    } else {
+      Serial.println("[API] getTemplateRaw failed — register tanpa hex");
+    }
+    String regResp = postRegister(empId, id, hexStr.length() ? hexStr.c_str() : "");
+    if (regResp.length() > 0) {
+      emit(F("{\"event\":\"register_server\",\"response\":%s}"), regResp.c_str());
+    } else {
+      emit(F("{\"event\":\"register_server\",\"response\":{\"status\":\"error\",\"message\":\"backend_unreachable\"}}"));
+    }
+  }
+
   lcdEnrollStep("DONE", 100, NULL, COL_OK);
   char msg[32];
   snprintf(msg, sizeof(msg), "ID:%d Enrolled", id);
@@ -924,6 +995,9 @@ void checkAutoSleep() {
 }
 
 void doAutoScan() {
+  static int fingerConfirm = 0;
+  static const int FINGER_CONFIRM_NEEDED = 2;
+
   switch (scanState) {
 
     case SCAN_IDLE: {
@@ -934,6 +1008,12 @@ void doAutoScan() {
       lastScanActivity = millis();
 
       if (p == FINGERPRINT_OK) {
+        fingerConfirm++;
+        if (fingerConfirm < FINGER_CONFIRM_NEEDED) {
+          scanCooldownUntil = millis() + 50;
+          break;
+        }
+        fingerConfirm = 0;
         scanState = SCAN_BUSY;
         lcdShowScanning();
 
@@ -977,6 +1057,7 @@ void doAutoScan() {
         consecutiveErrors = 0;
       } else if (p == FINGERPRINT_NOFINGER) {
         consecutiveErrors = 0;
+        fingerConfirm = 0;
       } else {
         consecutiveErrors++;
         if (consecutiveErrors <= 2) {
@@ -1019,6 +1100,7 @@ void doAutoScan() {
         flushRX();
         scanState = SCAN_IDLE;
         consecutiveErrors = 0;
+        fingerConfirm = 0;
         lcdShowIdle();
       }
       break;
@@ -1333,6 +1415,42 @@ String apiProxyGet(const char *path, int &httpCode) {
     resp = http.getString();
     Serial.print("[API] Response len: "); Serial.println(resp.length());
   }
+  http.end();
+  delete client;
+  return resp;
+}
+
+
+String apiProxyPost(const char *path, const String &body, int &httpCode) {
+  httpCode = -1;
+  if (!appSettings.apiBaseUrl[0]) return "";
+  if (WiFi.status() != WL_CONNECTED) return "";
+
+  String url = String(appSettings.apiBaseUrl) + path;
+  Serial.print("[API] POST "); Serial.println(url);
+
+  bool isHttps = url.startsWith("https://");
+  WiFiClient *client;
+  WiFiClientSecure *wc = nullptr;
+  if (isHttps) {
+    wc = new WiFiClientSecure();
+    wc->setInsecure();
+    client = wc;
+  } else {
+    client = new WiFiClient();
+  }
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(20000);
+  if (!http.begin(*client, url)) {
+    delete client;
+    return "";
+  }
+  http.addHeader("Content-Type", "application/json");
+  httpCode = http.POST(body);
+  String resp = "";
+  if (httpCode > 0) resp = http.getString();
   http.end();
   delete client;
   return resp;
@@ -1763,6 +1881,210 @@ void handleRestoreTemplate() {
   resp += ",\"id\":" + String(id);
   resp += ",\"status\":\"" + String(ok ? "restored" : "failed") + "\"}";
   server.send(ok ? 200 : 500, "application/json", resp);
+}
+
+
+// ────────────────────────────────────────────────────────────────────
+uint8_t nextFreeFingerId() {
+  for (uint8_t id = 1; id <= (uint8_t)MAX_FP; id++) {
+    bool used = false;
+    for (int i = 0; i < fpCount; i++) {
+      if (fpDB[i].id == id) { used = true; break; }
+    }
+    if (!used) return id;
+  }
+  return 0;
+}
+
+int findDbByEmpId(const char *empId) {
+  if (!empId || !empId[0]) return -1;
+  for (int i = 0; i < fpCount; i++) {
+    if (strcmp(fpDB[i].empId, empId) == 0) return i;
+  }
+  return -1;
+}
+
+// Sinkron template dari server PJTKI → sensor FPM10A (hanya employeeIds yang dipilih)
+void handleSyncFromServer() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (server.method() == HTTP_OPTIONS) { server.send(200); return; }
+  if (!requireAuth()) return;
+  if (enrollActive || restoreActive) {
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"busy\"}");
+    return;
+  }
+  if (!appSettings.apiBaseUrl[0]) {
+    server.send(422, "application/json", "{\"ok\":false,\"error\":\"apiBaseUrl_empty\"}");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(502, "application/json", "{\"ok\":false,\"error\":\"wifi_not_connected\"}");
+    return;
+  }
+
+  DynamicJsonDocument reqDoc(4096);
+  if (deserializeJson(reqDoc, server.arg("plain"))) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"bad_json\"}");
+    return;
+  }
+  JsonArray want = reqDoc["employeeIds"].as<JsonArray>();
+  if (want.isNull() || want.size() == 0) {
+    server.send(422, "application/json", "{\"ok\":false,\"error\":\"employeeIds_required\"}");
+    return;
+  }
+  if (want.size() > 30) {
+    server.send(422, "application/json", "{\"ok\":false,\"error\":\"max_30_ids\"}");
+    return;
+  }
+
+  restoreActive = true;
+  bool oldAuto = autoScan;
+  autoScan = false;
+
+  int restored = 0, skipped = 0, failed = 0, noHex = 0;
+
+  for (JsonVariant v : want) {
+    const char *empId = v.as<const char*>();
+    if (!empId || !empId[0]) continue;
+
+    if (findDbByEmpId(empId) >= 0) {
+      skipped++;
+      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"skipped_local\"}"), empId);
+      continue;
+    }
+
+    String onePath = String("/api/finger/arduino/template/") + empId;
+    int code2 = 0;
+    String oneResp = apiProxyGet(onePath.c_str(), code2);
+    if (oneResp.length() == 0 || code2 < 200 || code2 >= 300) {
+      if (code2 == 422) noHex++;
+      else failed++;
+      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"fetch_fail\"}"), empId);
+      continue;
+    }
+
+    DynamicJsonDocument oneDoc(3072);
+    if (deserializeJson(oneDoc, oneResp) || !oneDoc["success"]) {
+      if (code2 == 422) noHex++;
+      else failed++;
+      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"no_hex\"}"), empId);
+      continue;
+    }
+
+    const char *hex = oneDoc["data"]["template_hex"] | "";
+    const char *nm = oneDoc["data"]["nama"] | "";
+    int preferId = oneDoc["data"]["finger_id"] | 0;
+
+    uint8_t tpl[256];
+    if (!hex[0] || !fromHex(hex, tpl, 256)) {
+      failed++;
+      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"bad_hex\"}"), empId);
+      continue;
+    }
+
+    uint8_t id = 0;
+    if (preferId > 0 && preferId <= MAX_FP) {
+      bool used = false;
+      for (int i = 0; i < fpCount; i++) if (fpDB[i].id == (uint8_t)preferId) { used = true; break; }
+      if (!used) id = (uint8_t)preferId;
+    }
+    if (!id) id = nextFreeFingerId();
+    if (!id) {
+      failed++;
+      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"no_slot\"}"), empId);
+      break;
+    }
+
+    flushRX();
+    delay(20);
+    if (finger.loadModel(id) == FINGERPRINT_OK) {
+      uint8_t found = 0;
+      for (uint8_t cand = 1; cand <= (uint8_t)MAX_FP; cand++) {
+        bool usedDb = false;
+        for (int i = 0; i < fpCount; i++) {
+          if (fpDB[i].id == cand) { usedDb = true; break; }
+        }
+        if (usedDb) continue;
+        flushRX();
+        delay(10);
+        if (finger.loadModel(cand) != FINGERPRINT_OK) { found = cand; break; }
+      }
+      id = found;
+      if (!id) { failed++; emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"no_slot\"}"), empId); break; }
+    }
+
+    bool ok = putTemplateRaw(id, tpl);
+    if (ok) {
+      dbAdd(id, nm && nm[0] ? nm : empId, empId);
+      restored++;
+      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"id\":%d,\"status\":\"restored\"}"), empId, id);
+    } else {
+      failed++;
+      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"write_fail\"}"), empId);
+    }
+    delay(50);
+    yield();
+  }
+
+  finger.getTemplateCount();
+  if (oldAuto) { autoScan = true; lcdShowIdle(); }
+  restoreActive = false;
+
+  String resp = "{\"ok\":true";
+  resp += ",\"restored\":" + String(restored);
+  resp += ",\"skipped\":" + String(skipped);
+  resp += ",\"failed\":" + String(failed);
+  resp += ",\"noHex\":" + String(noHex);
+  resp += "}";
+  emit(F("{\"event\":\"sync_complete\",\"restored\":%d,\"skipped\":%d,\"failed\":%d}"), restored, skipped, failed);
+  server.send(200, "application/json", resp);
+}
+
+// Proxy daftar template server (untuk UI pilih anak, lintas cabang)
+static String urlEncodeParam(const String &s) {
+  String out;
+  const char *hx = "0123456789ABCDEF";
+  for (unsigned i = 0; i < s.length(); i++) {
+    unsigned char c = (unsigned char)s[i];
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+        || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += (char)c;
+    } else {
+      out += '%';
+      out += hx[(c >> 4) & 0xF];
+      out += hx[c & 0xF];
+    }
+  }
+  return out;
+}
+
+void handleServerTemplates() {
+  if (!requireAuth()) return;
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(502, "application/json", "{\"ok\":false,\"error\":\"wifi_not_connected\"}");
+    return;
+  }
+  String path = "/api/finger/arduino/templates";
+  String qs = "";
+  if (server.hasArg("kode_cabang")) {
+    qs += (qs.length() ? "&" : "?");
+    qs += "kode_cabang=";
+    qs += urlEncodeParam(server.arg("kode_cabang"));
+  }
+  if (server.hasArg("q")) {
+    qs += (qs.length() ? "&" : "?");
+    qs += "q=";
+    qs += urlEncodeParam(server.arg("q"));
+  }
+  path += qs;
+  int httpCode = 0;
+  String resp = apiProxyGet(path.c_str(), httpCode);
+  if (resp.length() == 0) {
+    server.send(502, "application/json", "{\"ok\":false,\"error\":\"backend_unreachable\",\"httpCode\":" + String(httpCode) + "}");
+    return;
+  }
+  server.send(200, "application/json", resp);
 }
 
 void handleStorage() {
@@ -2439,6 +2761,10 @@ void setup() {
   server.on("/api/restore", HTTP_OPTIONS, handleRestore);
   server.on("/api/restore/template", HTTP_POST, handleRestoreTemplate);
   server.on("/api/restore/template", HTTP_OPTIONS, handleRestoreTemplate);
+  server.on("/api/sync/from-server", HTTP_POST, handleSyncFromServer);
+  server.on("/api/sync/from-server", HTTP_OPTIONS, handleSyncFromServer);
+  server.on("/api/server/templates", HTTP_GET, handleServerTemplates);
+  server.on("/api/server/templates", HTTP_OPTIONS, handleServerTemplates);
   server.on("/api/storage", HTTP_GET, handleStorage);
   // Credentials API
   server.on("/api/credentials", HTTP_GET, handleCredGet);
