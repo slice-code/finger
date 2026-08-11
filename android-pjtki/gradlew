@@ -1,0 +1,4 @@
+#!/bin/sh
+export ANDROID_HOME=/home/gugus/Android/Sdk
+CLASSPATH=/home/gugus/.gradle/wrapper/dists/gradle-8.10.2-bin/a04bxjujx95o3nb99gddekhwo/gradle-8.10.2/lib/gradle-launcher-8.10.2.jar
+exec java -classpath "$CLASSPATH" org.gradle.launcher.GradleMain "$@"

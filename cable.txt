@@ -1,0 +1,49 @@
+=====================================
+WIRING — ESP32 FPM10A 3.3V Version
+=====================================
+
+=== ESP32 ↔ FPM10A Finger Sensor ===
+RX2 (GPIO16) → FPM10A TX
+TX2 (GPIO17) → FPM10A RX
+3V3           → FPM10A VCC
+GND           → FPM10A GND
+--- Touch Gate (T-OUT) ---
+3V3           → FPM10A T-3V3
+GPIO13        → FPM10A T-OUT
+
+=== ESP32 ↔ ILI9341 TFT LCD SPI ===
+GPIO5  → CS
+GPIO2  → DC
+GPIO4  → RST
+GPIO18 → SCK
+GPIO23 → MOSI
+VIN 5V → VCC     (5V)
+
+  CATATAN: Saat ini LCD VCC dipindah ke 3V3 ESP32 (bukan 5V) karena:
+  - LCD blank putih saat ada lonjakan dari stopkontak (spike dari Type-C)
+  - 3V3 sudah lewat AMS1117 → noise dari USB terfilter → LCD aman
+  - Konsekuensi: backlight lebih redup (3.3V bukan 5V), AMS1117 lebih panas
+    karena beban ESP32 + FPM10A + LCD semua di 3.3V
+  - Kapasitor 100µF di 3V3 dekat ESP32 melindungi semuanya
+GND    → GND
+
+=== LCD Backlight PWM ===
+GPIO15 → pin "LED" modul LCD
+         (LANGSUNG, tanpa resistor, tanpa transistor.
+          Modul LCD sudah punya driver LED di PCB-nya.)
+
+Perilaku backlight:
+- Idle (tanpa jari)      : redup 12%  (ledcWrite(LCD_BL, 30))
+- Jari menyentuh         : 100%       (ledcWrite(LCD_BL, 255))
+- 60 detik tanpa aktivitas : mati total (ledcWrite(LCD_BL, 0))
+
+PWM: ledcAttach(LCD_BL, 250, 8) — 250Hz, 8-bit (0-255)
+Tidak pakai pinMode(OUTPUT) — ledcAttach sudah menangani.
+
+=== Catatan ===
+- LCD VCC di 5V (bukan 3.3V) karena modul punya regulator sendiri
+  → mengurangi beban regulator 3.3V ESP32 → ESP32 lebih adem
+- FPM10A LED (lampu kuning) dikontrol via finger.LEDcontrol(true/false)
+  (0x50/0x51) — mati saat idle, nyala 100ms sebelum getImage
+- CPU ESP32: 80MHz (setCpuFrequencyMhz)
+- TX Power WiFi: 11dBm (WiFi.setTxPower)

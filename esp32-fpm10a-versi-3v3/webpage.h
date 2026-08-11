@@ -264,6 +264,7 @@ border:1.5px solid var(--border);border-radius:10px;margin-bottom:6px;cursor:poi
     <label>Kode Cabang</label><input id="scab" placeholder="CKS">
     <label>Device ID</label><input id="sdev" placeholder="arduino-001">
     <label>API Key (X-Device-Key)</label><input id="skey" type="password" placeholder="Isi key dari server PJTKI">
+    <label style="display:flex;align-items:center;gap:8px;margin-top:12px"><input type="checkbox" id="siren" style="width:auto;margin:0"> Aktifkan gate sensor sentuh (T-OUT)</label>
     <button class="btn btn-c" onclick="saveSettings()">Simpan Setelan</button>
   </div>
   <div class="card"><h3>Status</h3>
@@ -271,6 +272,7 @@ border:1.5px solid var(--border);border-radius:10px;margin-bottom:6px;cursor:poi
       <div>WiFi Mode: <span id="sfg-wmode" style="color:var(--text)">-</span></div>
       <div>IP: <span id="sfg-ip" style="color:var(--text)">-</span></div>
       <div>Fingerprint: <span id="sfg-fp" style="color:var(--text)">-</span></div>
+      <div>Gate Sentuh: <span id="sfg-ir" style="color:var(--text)">-</span></div>
     </div>
   </div>
 </div>
@@ -361,6 +363,7 @@ document.getElementById('dwip').textContent=d.wifiMode==='STA'?d.staIP:'192.168.
 var e=document.getElementById('sfg-wmode');if(e)e.textContent=d.wifiMode;
 var e=document.getElementById('sfg-ip');if(e)e.textContent=d.wifiMode==='STA'?d.staIP:'192.168.4.1';
 var e=document.getElementById('sfg-fp');if(e)e.textContent=d.count+' templates | baud:'+d.baud;
+var e=document.getElementById('sfg-ir');if(e)e.textContent=d.irEnabled?(d.irFinger?'JARI':'ON') : 'OFF';
 autoOn=d.autoOn;
 }).catch(()=>{})}
 
@@ -519,6 +522,7 @@ document.getElementById('sapi').value=d.apiBaseUrl||'';
 document.getElementById('scab').value=d.kode_cabang||'';
 document.getElementById('sdev').value=d.device_id||'';
 document.getElementById('skey').value=d.api_key||'';
+document.getElementById('siren').checked=d.ir_enabled!==false;
 }).catch(()=>{})
 updStatus()}
 
@@ -527,8 +531,9 @@ var u=document.getElementById('sapi').value.trim();
 var c=document.getElementById('scab').value.trim();
 var dv=document.getElementById('sdev').value.trim();
 var ak=document.getElementById('skey').value.trim();
+var ir=document.getElementById('siren').checked;
 if(!u){alert('API URL wajib diisi');return}
-api('/api/settings','POST',{apiBaseUrl:u,kode_cabang:c,device_id:dv,api_key:ak}).then(d=>{
+api('/api/settings','POST',{apiBaseUrl:u,kode_cabang:c,device_id:dv,api_key:ak,ir_enabled:ir}).then(d=>{
 if(d.ok){alert('Setelan tersimpan!');}
 }).catch(()=>alert('Gagal menyimpan'))}
 

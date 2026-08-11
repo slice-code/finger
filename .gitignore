@@ -1,2 +1,7 @@
 node_modules/
 dist/
+android-pjtki/app/build/
+android-pjtki/.gradle/
+*.apk
+*.log
+esp32-fpm10a-versi-3v3/*.ino.bak
