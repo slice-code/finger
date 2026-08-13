@@ -1,6 +1,9 @@
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <HTTPClient.h>
+#include <StreamString.h>
 #include <WiFiClientSecure.h>
 #include <Adafruit_Fingerprint.h>
 #include <TFT_eSPI.h>
@@ -11,6 +14,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
@@ -45,6 +49,9 @@ HardwareSerial altSerial(2);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&altSerial);
 TFT_eSPI tft = TFT_eSPI();
 WebServer server(80);
+DNSServer dnsServer;
+bool dnsServerActive = false;
+#define DNS_PORT 53
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "id.pool.ntp.org", 25200, 60000); // WIB (UTC+7)
 
@@ -96,11 +103,115 @@ bool credSave() {
   return true;
 }
 
-bool requireAuth() {
-  if (!server.authenticate(cred.webUser, cred.webPass)) {
-    server.requestAuthentication();
+// Harus di atas requireAuth() — flag mode AP setup (bukan auth).
+bool wifiApSetupMode = true;
+
+// Satu HTTPS/TLS pada satu waktu (attnHttp + cache + register) — cegah OOM NimBLE.
+static SemaphoreHandle_t httpsMutex = nullptr;
+static volatile bool httpsBusy = false;
+bool cacheSyncBusy = false;  // forward — dipakai WiFi scan guard sebelum blok cache
+
+bool httpsLock(uint32_t waitMs) {
+  if (!httpsMutex) return true;
+  if (xSemaphoreTake(httpsMutex, pdMS_TO_TICKS(waitMs)) != pdTRUE) return false;
+  httpsBusy = true;
+  return true;
+}
+void httpsUnlock() {
+  httpsBusy = false;
+  if (httpsMutex) xSemaphoreGive(httpsMutex);
+}
+
+// ── Shared outbound HTTP(S) client ─────────────────────────────────
+// Satu WiFiClientSecure untuk semua API — 4× static client sebelumnya
+// boros ~15–25KB RAM/tls context dan HTTPS ke Cloudflare sering gagal (OOM).
+static WiFiClientSecure apiSecureClient;
+static WiFiClient apiPlainClient;
+static bool apiTlsConfigured = false;
+
+// TLS mbedTLS + Cloudflare butuh ~60–80KB free. Di bawah ini HTTPS sering
+// jadi "connection refused" palsu. HTTP ke host yang sama tetap jalan.
+#ifndef API_HTTPS_MIN_HEAP
+#define API_HTTPS_MIN_HEAP 70000u
+#endif
+
+static void apiTlsConfigure() {
+  if (apiTlsConfigured) return;
+  apiSecureClient.setInsecure();
+  apiSecureClient.setHandshakeTimeout(30000);  // TLS handshake Cloudflare butuh waktu
+  apiTlsConfigured = true;
+}
+
+static void apiTlsReset() {
+  apiTlsConfigure();
+  apiSecureClient.setInsecure();  // ulang tiap request — state bisa kotor setelah stop()
+  apiSecureClient.stop();  // reset sesi TLS, jangan delete objek (use-after-free WiFi)
+}
+
+static bool apiUrlIsHttps(const String &url) {
+  return url.startsWith("https://") || url.startsWith("HTTPS://");
+}
+
+// https://host/path → http://host/path (untuk fallback RAM / retry).
+static String apiToPlainHttp(const String &url) {
+  if (url.startsWith("https://")) return String("http://") + url.substring(8);
+  if (url.startsWith("HTTPS://")) return String("http://") + url.substring(8);
+  return url;
+}
+
+// Pilih URL efektif: paksa HTTP jika heap ketat (HTTPS hampir pasti gagal).
+static String apiEffectiveUrl(const String &url) {
+  if (!apiUrlIsHttps(url)) return url;
+  uint32_t heap = ESP.getFreeHeap();
+  if (heap < API_HTTPS_MIN_HEAP) {
+    String plain = apiToPlainHttp(url);
+    Serial.printf("[API] HTTPS->HTTP (heap=%u < %u) %s\n",
+                  heap, (unsigned)API_HTTPS_MIN_HEAP, plain.c_str());
+    return plain;
+  }
+  return url;
+}
+
+static void apiHttpLogError(const char *tag, HTTPClient &http, int code) {
+  if (code > 0) return;
+  const String err = http.errorToString(code);
+  Serial.printf("[%s] HTTP err %d (%s) heap=%u\n", tag, code, err.c_str(), ESP.getFreeHeap());
+  logError("%s HTTP err %d (%s) heap=%u", tag, code, err.c_str(), ESP.getFreeHeap());
+}
+
+// Begin HTTPClient — HTTPS: no reuse, stop() dulu, timeout lebih panjang.
+// Pemanggil boleh kirim URL https; di sini otomatis turun ke http jika heap ketat.
+static bool apiHttpBegin(HTTPClient &http, WiFiClient *&client, const String &urlIn, uint32_t timeoutMs = 0) {
+  String url = apiEffectiveUrl(urlIn);
+  bool tls = apiUrlIsHttps(url);
+  if (tls) {
+    apiTlsReset();
+    client = &apiSecureClient;
+    http.setReuse(false);
+    if (!timeoutMs) timeoutMs = 30000;
+  } else {
+    // Jangan stop() agresif di plain TCP — bisa ganggu lwIP async close.
+    client = &apiPlainClient;
+    http.setReuse(false);
+    if (!timeoutMs) timeoutMs = 12000;
+  }
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(timeoutMs);
+  Serial.printf("[API] begin %s heap=%u\n", url.c_str(), ESP.getFreeHeap());
+  if (!http.begin(*client, url)) {
+    Serial.printf("[API] begin failed url=%s tls=%d heap=%u\n", url.c_str(), tls ? 1 : 0, ESP.getFreeHeap());
+    logError("API begin failed tls=%d heap=%u", tls ? 1 : 0, ESP.getFreeHeap());
     return false;
   }
+  return true;
+}
+
+bool requireAuth() {
+  // Web UI lokal: tanpa HTTP Basic Auth di AP maupun STA.
+  // - AP: dilindungi password softAP; Basic Auth bikin HP stuck 401.
+  // - STA (WiFi connected): akses lewat IP LAN, bukan Access Point —
+  //   Basic Auth juga sering 401 di browser HP.
+  // Kredensial web tetap di tab Akun (disimpan), tidak dipakai gate HTTP.
   return true;
 }
 
@@ -111,13 +222,27 @@ bool sensorReady = false;
 bool enrollActive = false;
 bool restoreActive = false;
 bool wifiConnected = false;
+// wifiApSetupMode dideklarasikan di atas requireAuth().
+// true = AP setup → jangan auto WiFi.begin berkala (AP goyang / client putus).
+bool wifiStaEverOk = false;  // pernah sukses STA di sesi boot ini
+String staIP = "";
+String staSSID = "";
 bool scanSleeping = false;
 bool ledOn = false;           // LED FPM10A terkontrol via 0x50/0x51 (sensor klon baru)
+unsigned long ledOnSince = 0; // sejak kapan LED nyala (auto-off 5 detik)
+#define LED_AUTO_OFF_MS 5000  // LED nyala >5s tanpa hasil scan → mati paksa
+bool irPolarityHigh = true;   // true = jari terdeteksi saat pin HIGH
+bool irCalibrated = false;
+bool irFallbackMode = false;  // gate tidak pernah berubah → pakai fallback polling normal
+bool irGateOpen = false;
+unsigned long irDetSince = 0;
+unsigned long irClearSince = 0;
+unsigned long irGateOpenedAt = 0;
+unsigned long irGateCooldownUntil = 0;
+unsigned long lastFallbackPoll = 0;
 bool lcdBacklightOn = true;
 unsigned long lastLcdActivity = 0;
 #define LCD_IDLE_TIMEOUT_MS 60000
-String staIP = "";
-String staSSID = "";
 unsigned long curBaud = 0;
 char rxBuf[80];
 uint8_t rxLen = 0;
@@ -128,10 +253,11 @@ unsigned long scanResultTime = 0;
 unsigned long scanCooldownUntil = 0;
 int consecutiveErrors = 0;
 uint8_t fallbackErrors = 0;
-#define SCAN_RESULT_HOLD_MS 4000
+bool fingerMustRelease = false;  // setelah scan: wajib angkat jari dulu sebelum scan/enroll ulang
+#define SCAN_RESULT_HOLD_MS 800   // tampil hasil singkat — jangan bikin terasa lambat
 #define MAX_CONSECUTIVE_ERRORS 8   // 3.3V: lebih toleran transient error
 #define SCAN_SOFT_RECOVER_MS 1000  // jeda setelah error burst sebelum scan ulang
-#define LED_WARMUP_MS       50    // jeda setelah LED ON sebelum getImage()
+#define LED_WARMUP_MS      120    // jeda setelah LED ON sebelum getImage() (3.3V butuh lebih lama)
 #define LED_OFF_RETRY_MS  2000    // retry hanya jika perintah LED OFF gagal
 
 // ── Watchdog / Auto-Recovery ──────────────────────────────────────
@@ -140,7 +266,7 @@ unsigned long lastRecoveryAttempt = 0;
 uint8_t recoveryCount = 0;
 #define SCAN_WATCHDOG_MS   20000  // 20 detik tanpa aktivitas = recovery (3.3V lebih lambat)
 #define RECOVERY_COOLDOWN  5000   // jeda antar recovery attempt
-#define MAX_RECOVERY       3      // max recovery sebelum ESP.restart()
+#define MAX_RECOVERY       3      // max soft recovery; lalu idle+AP (bukan ESP.restart)
 
 // ── WiFi credentials ──────────────────────────────────────────────
 #define MAX_SAVED_WIFI 5
@@ -159,6 +285,8 @@ struct AppSettings {
   uint8_t scanEndHour;    // jam selesai scan (0-23)
   bool scanSchedule;      // true = pakai jadwal
   bool irEnabled;         // true = IR obstacle gate aktif (default)
+  bool apEnabled;         // false = BLE-only setup (softAP mati)
+  uint16_t uploadIntervalMinutes; // jadwal auto-sync pending (default 120 = 2 jam)
 };
 AppSettings appSettings;
 
@@ -454,9 +582,15 @@ void lcdDrawFooter() {
   } else {
     tft.fillCircle(SIDEBAR_W + 10, FOOTER_Y + 10, 3, COL_WARN);
     tft.setTextColor(COL_WARN, COL_TOPBAR);
-    tft.drawString("AP:" AP_SSID, SIDEBAR_W + 18, FOOTER_Y + 5);
-    tft.setTextColor(COL_DIM2, COL_TOPBAR);
-    tft.drawString("192.168.4.1", SIDEBAR_W + 18, FOOTER_Y + 17);
+    if (appSettings.apEnabled) {
+      tft.drawString("AP:" AP_SSID, SIDEBAR_W + 18, FOOTER_Y + 5);
+      tft.setTextColor(COL_DIM2, COL_TOPBAR);
+      tft.drawString("192.168.4.1", SIDEBAR_W + 18, FOOTER_Y + 17);
+    } else {
+      tft.drawString("BLE:PJTKI-Finger", SIDEBAR_W + 18, FOOTER_Y + 5);
+      tft.setTextColor(COL_DIM2, COL_TOPBAR);
+      tft.drawString("AP off — setup via app", SIDEBAR_W + 18, FOOTER_Y + 17);
+    }
   }
 
   tft.setTextDatum(TR_DATUM);
@@ -585,7 +719,10 @@ void lcdShowAttendanceStatus(const char *status) {
   tft.fillRoundRect(28, 176, SCREEN_W - 56, 14, 4, COL_DIM3);
   tft.setTextDatum(TC_DATUM);
   tft.setTextSize(1);
-  if (strcmp(status, "checkin") == 0) {
+  if (strcmp(status, "sending") == 0) {
+    tft.setTextColor(COL_ACCENT, COL_DIM3);
+    tft.drawString("MENGIRIM ABSENSI...", SCREEN_W / 2, 183);
+  } else if (strcmp(status, "checkin") == 0) {
     tft.setTextColor(COL_OK, COL_DIM3);
     tft.drawString("CHECK IN", SCREEN_W / 2, 183);
   } else if (strcmp(status, "checkout") == 0) {
@@ -594,6 +731,16 @@ void lcdShowAttendanceStatus(const char *status) {
   } else if (strcmp(status, "ignored") == 0) {
     tft.setTextColor(COL_WARN, COL_DIM3);
     tft.drawString("SUDAH ABSEN", SCREEN_W / 2, 183);
+  } else if (strcmp(status, "offline") == 0) {
+    tft.setTextColor(COL_WARN, COL_DIM3);
+    tft.drawString("OFFLINE — absensi lokal", SCREEN_W / 2, 183);
+  } else if (strcmp(status, "ok") == 0 || strcmp(status, "success") == 0 ||
+             strcmp(status, "berhasil") == 0) {
+    tft.setTextColor(COL_OK, COL_DIM3);
+    tft.drawString("BERHASIL", SCREEN_W / 2, 183);
+  } else if (strcmp(status, "not_found") == 0) {
+    tft.setTextColor(COL_ERR, COL_DIM3);
+    tft.drawString("TIDAK DIKENALI", SCREEN_W / 2, 183);
   } else {
     tft.setTextColor(COL_ERR, COL_DIM3);
     tft.drawString("GAGAL KIRIM", SCREEN_W / 2, 183);
@@ -710,6 +857,33 @@ void emit(const __FlashStringHelper *fmt, ...) {
   Serial.println(buf);
   Serial.flush();
   broadcastSSE(buf);
+  bleNotifyEvent(buf);
+}
+
+// Escape string untuk disisipkan ke payload JSON (SSE/BLE). Mencegah
+// injection yang merusak JSON semua client saat nama/employeeId berisi
+// tanda kutip atau backslash.
+const char *jsonEscape(const char *in) {
+  static char esc[256];
+  int j = 0;
+  for (const char *s = in; *s && j < (int)sizeof(esc) - 2; s++) {
+    unsigned char c = (unsigned char)*s;
+    switch (c) {
+      case '"':  esc[j++] = '\\'; esc[j++] = '"';  break;
+      case '\\': esc[j++] = '\\'; esc[j++] = '\\'; break;
+      case '\n': esc[j++] = '\\'; esc[j++] = 'n';  break;
+      case '\r': esc[j++] = '\\'; esc[j++] = 'r';  break;
+      case '\t': esc[j++] = '\\'; esc[j++] = 't';  break;
+      default:
+        if (c < 0x20) {
+          j += snprintf(esc + j, sizeof(esc) - (size_t)j, "\\u%04x", c);
+        } else {
+          esc[j++] = (char)c;
+        }
+    }
+  }
+  esc[j] = 0;
+  return esc;
 }
 
 bool nextLine(char *out, size_t n) {
@@ -726,24 +900,167 @@ bool nextLine(char *out, size_t n) {
   return false;
 }
 
+// Enroll butuh LED tetap nyala di antara 2 scan. Jangan pakai getImage()
+// untuk deteksi jari diangkat: GenImg + NOFINGER pada klon baru mematikan
+// lampu penerangan, sehingga scan ke-2 tidak pernah dapat gambar.
+bool irRawDetected();
+static void enrollLedKeepOn() {
+  // Jangan set ledOn=true tanpa verifikasi — jika LEDcontrol gagal (sensor
+  // error), LED fisik mati tapi ledOn=true → scan tidak pernah menyalakan
+  // ulang → LED stuck mati walau jari disentuh.
+  uint8_t r = finger.LEDcontrol(true);
+  ledOn = (r == FINGERPRINT_OK);
+  if (!ledOn) {
+    ledOnSince = 0;
+  }
+}
+
+static void enrollKeepAliveUi() {
+  lastScanActivity = millis();
+  lastLcdActivity = millis();
+  if (!lcdBacklightOn) {
+    lcdBacklightOn = true;
+    ledcWrite(LCD_BL, 255);
+  } else {
+    ledcWrite(LCD_BL, 255);
+  }
+  enrollLedKeepOn();
+}
+
+// Bangunkan LCD saja (konek BLE) — JANGAN nyalakan LED FPM10A di sini.
+// LED tanpa ledOnSince bikin doAutoScan langsung masuk LED_AUTO_OFF → scan macet
+// sampai layar redup.
+void bleWakeLcd() {
+  lastScanActivity = millis();
+  lastLcdActivity = millis();
+  lcdBacklightOn = true;
+  ledcWrite(LCD_BL, 255);
+}
+
+// Bangunkan LCD + LED untuk enroll.
+void bleWakeUi() {
+  bleWakeLcd();
+  uint8_t r = finger.LEDcontrol(true);
+  bool ok = (r == FINGERPRINT_OK);
+  ledOn = ok;
+  ledOnSince = ok ? millis() : 0;
+  if (!ok) {
+    logError("LED ON (bleWakeUi) failed code=%d", r);
+  }
+}
+
+// Reset state scan/LED/gate sebelum enroll atau setelah gagal — supaya UART bersih.
+void sensorResumeIdle(const char *reason) {
+  Serial.printf("[SENSOR] resume idle (%s)\n", reason ? reason : "-");
+  enrollActive = false;
+  if (ledOn) {
+    uint8_t ledResult = finger.LEDcontrol(false);
+    if (ledResult != FINGERPRINT_OK) {
+      logError("LED OFF (resume idle) failed code=%d", ledResult);
+    }
+    // SELALU reset false — walau gagal, biarkan gate scan mencoba LED ON lagi.
+    ledOn = false;
+  }
+  ledOnSince = 0;
+  flushRX();
+  delay(30);
+  flushRX();
+  scanState = SCAN_IDLE;
+  scanCooldownUntil = 0;
+  fingerDown = false;
+  fingerMustRelease = false;
+  consecutiveErrors = 0;
+  irGateOpen = false;
+  irDetSince = irClearSince = 0;
+  irGateCooldownUntil = 0;
+  lastScanActivity = millis();
+  lastLcdActivity = millis();
+  autoScan = true;
+}
+
+// Timeout panjang: mode enroll menunggu jari sampai 2 scan selesai / dibatalkan.
+static const unsigned long ENROLL_WAIT_MS = 180000UL;
+
 bool waitNoFinger() {
   unsigned long t = millis();
-  while (millis() - t < 10000) {
-    lastScanActivity = millis();
+  unsigned long clearSince = 0;
+  unsigned long lastLedRefresh = 0;
+  int errStreak = 0;
+  while (millis() - t < ENROLL_WAIT_MS) {
+    if (bleEnrollCancelRequested) return false;
+    enrollKeepAliveUi();
+    yield();
+    if (millis() - lastLedRefresh > 800) {
+      lastLedRefresh = millis();
+      enrollLedKeepOn();
+    }
+    // Enroll: getImage adalah otoritas utama. IR hanya bantuan —
+    // jangan blokir jika T-OUT/IR belum deteksi (sering saat jari hanya di kaca optik).
     flushRX();
-    if (finger.getImage() == FINGERPRINT_NOFINGER) return true;
-    delay(50); yield();
+    disableLoopWDT();
+    uint8_t p = finger.getImage();
+    enableLoopWDT();
+    esp_task_wdt_reset();
+    enrollLedKeepOn();
+    delay(LED_WARMUP_MS);
+    if (p == FINGERPRINT_NOFINGER) {
+      if (appSettings.irEnabled && irCalibrated && irRawDetected()) {
+        // Sensor bilang kosong tapi IR masih “ada” — tunggu IR clear sebentar.
+        if (!clearSince) clearSince = millis();
+        else if (millis() - clearSince >= 120) return true;
+      } else {
+        return true;
+      }
+    } else if (p == FINGERPRINT_OK) {
+      // Ada jari masih nempel — tunggu sampai diangkat.
+      clearSince = 0;
+      errStreak = 0;
+    } else {
+      // Error komunikasi beruntun → sensor macet. Batalkan enroll cepat,
+      // jangan tunggu 180s (membuat "gagal sensor" menggantung).
+      if (++errStreak >= 5) {
+        logError("enroll waitNoFinger sensor error x%d (code=%d) — abort", errStreak, p);
+        return false;
+      }
+      clearSince = 0;
+    }
+    delay(40);
   }
   return false;
 }
 
 bool waitFinger() {
   unsigned long t = millis();
-  while (millis() - t < 10000) {
-    lastScanActivity = millis();
+  unsigned long lastLedRefresh = 0;
+  int errStreak = 0;
+  enrollKeepAliveUi();
+  delay(200);
+  while (millis() - t < ENROLL_WAIT_MS) {
+    if (bleEnrollCancelRequested) return false;
+    enrollKeepAliveUi();
+    yield();
+    if (millis() - lastLedRefresh > 800) {
+      lastLedRefresh = millis();
+      enrollLedKeepOn();
+    }
+    // Selalu poll getImage saat enroll — jangan menunggu IR dulu.
     flushRX();
-    if (finger.getImage() == FINGERPRINT_OK) return true;
-    delay(50); yield();
+    disableLoopWDT();
+    uint8_t p = finger.getImage();
+    enableLoopWDT();
+    esp_task_wdt_reset();
+    if (p == FINGERPRINT_OK) return true;
+    if (p != FINGERPRINT_NOFINGER) {
+      // Error komunikasi beruntun → sensor macet. Jangan tunggu 180s.
+      if (++errStreak >= 5) {
+        logError("enroll waitFinger sensor error x%d (code=%d) — abort", errStreak, p);
+        return false;
+      }
+    } else {
+      errStreak = 0;
+    }
+    enrollLedKeepOn();
+    delay(40);
   }
   return false;
 }
@@ -780,12 +1097,17 @@ void dbSave() {
   if (f) { serializeJson(doc, f); f.close(); }
 }
 
+void cacheSetEmployeeRegistered(const char *empId, bool registered);
+void cacheInvalidateAllEmployees();
+
 void dbAdd(uint8_t id, const char *name, const char *empId) {
   for (int i = 0; i < fpCount; i++) {
     if (fpDB[i].id == id) {
       strncpy(fpDB[i].name, name, 31);
       strncpy(fpDB[i].empId, empId ? empId : "", 15);
-      dbSave(); return;
+      dbSave();
+      if (empId && empId[0]) cacheSetEmployeeRegistered(empId, true);
+      return;
     }
   }
   if (fpCount < MAX_FP) {
@@ -794,19 +1116,30 @@ void dbAdd(uint8_t id, const char *name, const char *empId) {
     strncpy(fpDB[fpCount].empId, empId ? empId : "", 15);
     fpCount++;
     dbSave();
+    if (empId && empId[0]) cacheSetEmployeeRegistered(empId, true);
   }
 }
 
 void dbRemove(uint8_t id) {
   for (int i = 0; i < fpCount; i++) {
     if (fpDB[i].id == id) {
+      char empId[16];
+      strncpy(empId, fpDB[i].empId, 15);
+      empId[15] = 0;
       for (int j = i; j < fpCount - 1; j++) fpDB[j] = fpDB[j + 1];
-      fpCount--; dbSave(); return;
+      fpCount--;
+      dbSave();
+      if (empId[0]) cacheSetEmployeeRegistered(empId, false);
+      return;
     }
   }
 }
 
-void dbClear() { fpCount = 0; dbSave(); }
+void dbClear() {
+  fpCount = 0;
+  dbSave();
+  cacheInvalidateAllEmployees();
+}
 
 const char* dbGetName(uint8_t id) {
   for (int i = 0; i < fpCount; i++) if (fpDB[i].id == id) return fpDB[i].name;
@@ -942,9 +1275,30 @@ void wifiClearCreds() {
 // ────────────────────────────────────────────────────────────────────
 //  App Settings (apiBaseUrl, kodeCabang, deviceId)
 // ────────────────────────────────────────────────────────────────────
+// ESP32 + BLE: HTTPS ke Cloudflare sering gagal (RAM/TLS). Simpan sebagai http://.
+bool settingsNormalizeApiUrl(char *url, size_t cap) {
+  if (!url || !url[0] || cap < 10) return false;
+  bool https = (strncmp(url, "https://", 8) == 0) || (strncmp(url, "HTTPS://", 8) == 0);
+  if (!https) return false;
+  char tmp[128];
+  snprintf(tmp, sizeof(tmp), "http://%s", url + 8);
+  strncpy(url, tmp, cap - 1);
+  url[cap - 1] = 0;
+  return true;
+}
+
+bool settingsSave();  // forward — dipanggil saat migrasi https→http di load
+
 void settingsLoad() {
   memset(&appSettings, 0, sizeof(appSettings));
   appSettings.irEnabled = true;  // default aktif
+  // Default jadwal: aktif 05:00–00:00 (tidur 00–05) — sama perilaku lama hardcoded
+  appSettings.scanSchedule = true;
+  appSettings.scanStartHour = 5;
+  appSettings.scanEndHour = 0;
+  // BLE-first: softAP default OFF — setup WiFi/settings lewat app BLE
+  appSettings.apEnabled = false;
+  appSettings.uploadIntervalMinutes = 120; // default 2 jam
   if (!storageReady) return;
   File f = LittleFS.open(SETTINGS_FILENAME, "r");
   if (!f) return;
@@ -956,6 +1310,29 @@ void settingsLoad() {
   strncpy(appSettings.deviceId, doc["device_id"] | "", 31); appSettings.deviceId[31] = 0;
   strncpy(appSettings.apiKey, doc["api_key"] | "", 64); appSettings.apiKey[64] = 0;
   appSettings.irEnabled = doc["ir_enabled"] | true;
+  if (doc.containsKey("scan_schedule")) appSettings.scanSchedule = doc["scan_schedule"] | true;
+  if (doc.containsKey("scan_start_hour")) {
+    int h = doc["scan_start_hour"] | 5;
+    if (h < 0) h = 0; if (h > 23) h = 23;
+    appSettings.scanStartHour = (uint8_t)h;
+  }
+  if (doc.containsKey("scan_end_hour")) {
+    int h = doc["scan_end_hour"] | 0;
+    if (h < 0) h = 0; if (h > 23) h = 23;
+    appSettings.scanEndHour = (uint8_t)h;
+  }
+  // Tanpa key di JSON lama → tetap false (BLE-first). Explicit true untuk aktifkan AP.
+  if (doc.containsKey("ap_enabled")) appSettings.apEnabled = doc["ap_enabled"] | false;
+  if (doc.containsKey("upload_interval_minutes")) {
+    int v = doc["upload_interval_minutes"] | 120;
+    if (v < 5) v = 5; if (v > 1440) v = 1440;
+    appSettings.uploadIntervalMinutes = (uint16_t)v;
+  }
+  // Migrasi: https di LittleFS → http (ESP32+BLE tidak sanggup TLS stabil).
+  if (settingsNormalizeApiUrl(appSettings.apiBaseUrl, sizeof(appSettings.apiBaseUrl))) {
+    Serial.printf("[SET] migrated apiBaseUrl -> %s\n", appSettings.apiBaseUrl);
+    settingsSave();
+  }
 }
 
 bool settingsSave() {
@@ -966,6 +1343,11 @@ bool settingsSave() {
   doc["device_id"] = appSettings.deviceId;
   doc["api_key"] = appSettings.apiKey;
   doc["ir_enabled"] = appSettings.irEnabled;
+  doc["scan_schedule"] = appSettings.scanSchedule;
+  doc["scan_start_hour"] = appSettings.scanStartHour;
+  doc["scan_end_hour"] = appSettings.scanEndHour;
+  doc["ap_enabled"] = appSettings.apEnabled;
+  doc["upload_interval_minutes"] = appSettings.uploadIntervalMinutes;
   File f = LittleFS.open(SETTINGS_FILENAME, "w");
   if (!f) { logError("settings write open failed"); return false; }
   serializeJson(doc, f);
@@ -974,73 +1356,554 @@ bool settingsSave() {
 }
 
 // ────────────────────────────────────────────────────────────────────
+//  Offline attendance log + pending register queue (LittleFS)
+// ────────────────────────────────────────────────────────────────────
+// Absensi selalu disimpan dulu ke storage lokal, lalu di-upload ke server
+// secara berkala (uploadIntervalMinutes) / manual (SYNC_NOW via BLE).
+// Yang belum ter-upload ditandai synced=false dan akan di-retry saat sync.
+// ────────────────────────────────────────────────────────────────────
+#define ATTENDANCE_LOG "/attendance.json"
+#define ATTENDANCE_LOG_MAX 200
+#define PENDING_REGISTER_FILE "/pending_register.json"
+#define PENDING_REGISTER_MAX 20
+
+struct PendingAttendance {
+  char employeeId[40];
+  char nama[32];
+  char tanggal[12];   // YYYY-MM-DD
+  char jam[10];       // HH:MM:SS
+  bool synced;
+};
+PendingAttendance pendingAtt[ATTENDANCE_LOG_MAX];
+int pendingAttCount = 0;
+
+// Mutex: pendingAtt/pendingReg diakses dari attnWorker, syncWorker, loop,
+// dan task BLE — LittleFS tidak aman diakses bersamaan antar task.
+SemaphoreHandle_t pendingMutex = nullptr;
+
+static inline bool pendingLock() {
+  return pendingMutex ? xSemaphoreTake(pendingMutex, pdMS_TO_TICKS(50)) == pdTRUE : true;
+}
+static inline void pendingUnlock() {
+  if (pendingMutex) xSemaphoreGive(pendingMutex);
+}
+
+struct PendingRegister {
+  char employeeId[40];
+  uint8_t fingerId;
+  char hex[512];
+};
+PendingRegister pendingReg[PENDING_REGISTER_MAX];
+int pendingRegCount = 0;
+
+void pendingAttLoad() {
+  pendingLock();
+  pendingAttCount = 0;
+  if (!storageReady) { pendingUnlock(); return; }
+  File f = LittleFS.open(ATTENDANCE_LOG, "r");
+  if (!f) { pendingUnlock(); return; }
+  DynamicJsonDocument doc(ATTENDANCE_LOG_MAX * 120);
+  if (deserializeJson(doc, f)) { f.close(); pendingUnlock(); return; }
+  f.close();
+  JsonArray arr = doc.as<JsonArray>();
+  for (JsonObject o : arr) {
+    if (pendingAttCount >= ATTENDANCE_LOG_MAX) break;
+    PendingAttendance &p = pendingAtt[pendingAttCount];
+    memset(&p, 0, sizeof(p));
+    strncpy(p.employeeId, o["employeeId"] | "", sizeof(p.employeeId) - 1);
+    strncpy(p.nama, o["nama"] | "", sizeof(p.nama) - 1);
+    strncpy(p.tanggal, o["tanggal"] | "", sizeof(p.tanggal) - 1);
+    strncpy(p.jam, o["jam"] | "", sizeof(p.jam) - 1);
+    p.synced = o["synced"] | false;
+    pendingAttCount++;
+  }
+  pendingUnlock();
+}
+
+void pendingAttSave() {
+  if (!storageReady) return;
+  pendingLock();
+  DynamicJsonDocument doc(ATTENDANCE_LOG_MAX * 120);
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < pendingAttCount; i++) {
+    JsonObject o = arr.createNestedObject();
+    o["employeeId"] = pendingAtt[i].employeeId;
+    o["nama"] = pendingAtt[i].nama;
+    o["tanggal"] = pendingAtt[i].tanggal;
+    o["jam"] = pendingAtt[i].jam;
+    o["synced"] = pendingAtt[i].synced;
+  }
+  File f = LittleFS.open(ATTENDANCE_LOG, "w");
+  if (!f) { pendingUnlock(); return; }
+  serializeJson(doc, f);
+  f.close();
+  pendingUnlock();
+}
+
+void pendingRegLoad() {
+  pendingLock();
+  pendingRegCount = 0;
+  if (!storageReady) { pendingUnlock(); return; }
+  File f = LittleFS.open(PENDING_REGISTER_FILE, "r");
+  if (!f) { pendingUnlock(); return; }
+  DynamicJsonDocument doc(PENDING_REGISTER_MAX * 600);
+  if (deserializeJson(doc, f)) { f.close(); pendingUnlock(); return; }
+  f.close();
+  JsonArray arr = doc.as<JsonArray>();
+  for (JsonObject o : arr) {
+    if (pendingRegCount >= PENDING_REGISTER_MAX) break;
+    PendingRegister &p = pendingReg[pendingRegCount];
+    memset(&p, 0, sizeof(p));
+    strncpy(p.employeeId, o["employeeId"] | "", sizeof(p.employeeId) - 1);
+    p.fingerId = (uint8_t)(o["fingerId"] | 0);
+    strncpy(p.hex, o["hex"] | "", sizeof(p.hex) - 1);
+    pendingRegCount++;
+  }
+  pendingUnlock();
+}
+
+void pendingRegSave() {
+  if (!storageReady) return;
+  pendingLock();
+  DynamicJsonDocument doc(PENDING_REGISTER_MAX * 600);
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < pendingRegCount; i++) {
+    JsonObject o = arr.createNestedObject();
+    o["employeeId"] = pendingReg[i].employeeId;
+    o["fingerId"] = pendingReg[i].fingerId;
+    o["hex"] = pendingReg[i].hex;
+  }
+  File f = LittleFS.open(PENDING_REGISTER_FILE, "w");
+  if (!f) { pendingUnlock(); return; }
+  serializeJson(doc, f);
+  f.close();
+  pendingUnlock();
+}
+
+// Tambah catatan absensi (selalu, walau offline). Return index baru.
+int pendingAttAdd(const char *employeeId, const char *nama) {
+  if (!employeeId || !employeeId[0]) return -1;
+  pendingLock();
+  if (pendingAttCount >= ATTENDANCE_LOG_MAX) {
+    memmove(&pendingAtt[0], &pendingAtt[1], (ATTENDANCE_LOG_MAX - 1) * sizeof(PendingAttendance));
+    pendingAttCount--;
+  }
+  int idx = pendingAttCount;
+  PendingAttendance &p = pendingAtt[idx];
+  memset(&p, 0, sizeof(p));
+  strncpy(p.employeeId, employeeId, sizeof(p.employeeId) - 1);
+  strncpy(p.nama, nama ? nama : "", sizeof(p.nama) - 1);
+  time_t et = (time_t)timeClient.getEpochTime();
+  struct tm *ti = localtime(&et);
+  if (ti) {
+    snprintf(p.tanggal, sizeof(p.tanggal), "%04d-%02d-%02d", ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday);
+    snprintf(p.jam, sizeof(p.jam), "%02d:%02d:%02d", ti->tm_hour, ti->tm_min, ti->tm_sec);
+  } else {
+    strncpy(p.tanggal, "0000-00-00", sizeof(p.tanggal) - 1);
+    strncpy(p.jam, "00:00:00", sizeof(p.jam) - 1);
+  }
+  p.synced = false;
+  pendingAttCount++;
+  pendingUnlock();
+  pendingAttSave();
+  return idx;
+}
+
+// Tambah register finger yang belum ter-upload server (offline). Return true jika masuk antrean.
+bool pendingRegAdd(const char *employeeId, uint8_t fingerId, const char *hex) {
+  if (!employeeId || !employeeId[0]) return false;
+  pendingLock();
+  // dedup: update jika sudah ada employeeId+fingerId
+  for (int i = 0; i < pendingRegCount; i++) {
+    if (strcmp(pendingReg[i].employeeId, employeeId) == 0 && pendingReg[i].fingerId == fingerId) {
+      if (hex && hex[0]) strncpy(pendingReg[i].hex, hex, sizeof(pendingReg[i].hex) - 1);
+      pendingUnlock();
+      pendingRegSave();
+      return true;
+    }
+  }
+  if (pendingRegCount >= PENDING_REGISTER_MAX) { pendingUnlock(); return false; }
+  PendingRegister &p = pendingReg[pendingRegCount++];
+  memset(&p, 0, sizeof(p));
+  strncpy(p.employeeId, employeeId, sizeof(p.employeeId) - 1);
+  p.fingerId = fingerId;
+  if (hex && hex[0]) strncpy(p.hex, hex, sizeof(p.hex) - 1);
+  pendingUnlock();
+  pendingRegSave();
+  return true;
+}
+
+bool pendingRegRemove(int idx) {
+  pendingLock();
+  if (idx < 0 || idx >= pendingRegCount) { pendingUnlock(); return false; }
+  for (int i = idx; i < pendingRegCount - 1; i++) pendingReg[i] = pendingReg[i + 1];
+  pendingRegCount--;
+  pendingUnlock();
+  pendingRegSave();
+  return true;
+}
+
+// ────────────────────────────────────────────────────────────────────
 //  Backend API - POST attendance on fingerprint match
 // ────────────────────────────────────────────────────────────────────
-String postAttendance(const char *employeeId) {
-  if (!appSettings.apiBaseUrl[0] || !employeeId || !employeeId[0]) {
-    logError("attendance skipped: missing API URL or employee ID");
-    return "";
+// Upload absensi di task terpisah.
+// ATURAN KERAS: gagal koneksi/HTTP → tampil "error" di LCD. JANGAN reboot.
+// ────────────────────────────────────────────────────────────────────
+struct AttnJob {
+  char employeeId[40];
+  char timeBuf[24];
+  int pendingIdx;   // index di pendingAtt (-1 jika tidak ada)
+};
+static QueueHandle_t attnQueue = nullptr;
+static volatile bool attnResultPending = false;
+static char attnResultStatus[24] = "error";
+static volatile bool attnUploading = false;
+static unsigned long attnUiClearAt = 0;
+static unsigned long attnSendingSince = 0;  // 0 = tidak sedang "MENGIRIM"
+static char attnLastEmpId[40] = "";
+static unsigned long attnLastQueuedAt = 0;
+static WiFiClient attnClient;  // static — jangan WiFiClient di stack task (bisa panic)
+
+#define ATTN_DEDUP_MS 4000u
+#define ATTN_MIN_HEAP 26000u
+#define ATTN_RESULT_HOLD_MS 1100u
+#define ATTN_FAIL_HOLD_MS 1200u
+#define ATTN_HTTP_TIMEOUT_MS 3000u
+#define ATTN_SENDING_TIMEOUT_MS 4500u  // UI: MENGIRIM max segini → GAGAL (tanpa reboot)
+
+static void attnPublishResult(const char *st) {
+  strncpy(attnResultStatus, st && st[0] ? st : "error", sizeof(attnResultStatus) - 1);
+  attnResultStatus[sizeof(attnResultStatus) - 1] = 0;
+  attnResultPending = true;
+}
+
+// Parse http://host[:port]/path → buffer C (tanpa String besar).
+static bool attnParseUrl(const char *full, char *host, size_t hostCap,
+                         uint16_t *port, char *path, size_t pathCap) {
+  if (!full || !host || !port || !path || hostCap < 2 || pathCap < 2) return false;
+  host[0] = 0;
+  path[0] = '/';
+  path[1] = 0;
+  *port = 80;
+  const char *p = full;
+  if (strncmp(p, "https://", 8) == 0) p += 8;  // tetap pakai port 80 (http only)
+  else if (strncmp(p, "http://", 7) == 0) p += 7;
+  else return false;
+  const char *slash = strchr(p, '/');
+  size_t hlen = slash ? (size_t)(slash - p) : strlen(p);
+  if (hlen == 0 || hlen >= hostCap) return false;
+  memcpy(host, p, hlen);
+  host[hlen] = 0;
+  if (slash) {
+    strncpy(path, slash, pathCap - 1);
+    path[pathCap - 1] = 0;
   }
-  if (WiFi.status() != WL_CONNECTED) {
-    logError("attendance skipped: WiFi disconnected");
-    return "";
+  char *colon = strchr(host, ':');
+  if (colon) {
+    *colon = 0;
+    int pr = atoi(colon + 1);
+    if (pr > 0 && pr < 65536) *port = (uint16_t)pr;
+  }
+  return host[0] != 0;
+}
+
+// Baca 1 baris header (tanpa String) — timeout total di loop luar.
+static bool attnReadLine(WiFiClient &c, char *buf, size_t cap, unsigned long deadline) {
+  size_t n = 0;
+  while (millis() < deadline && n + 1 < cap) {
+    if (!c.available()) {
+      if (!c.connected()) break;
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+    int ch = c.read();
+    if (ch < 0) break;
+    if (ch == '\r') continue;
+    if (ch == '\n') {
+      buf[n] = 0;
+      return true;
+    }
+    buf[n++] = (char)ch;
+  }
+  buf[n] = 0;
+  return n > 0;
+}
+
+// Return: true + status server di outStatus, atau false (gagal jaringan/HTTP).
+// TIDAK BOLEH melempar/abort — semua error return false.
+static bool postAttendanceSafe(const char *employeeId, const char *timeIso,
+                               char *outStatus, size_t outCap) {
+  if (outStatus && outCap) {
+    strncpy(outStatus, "error", outCap - 1);
+    outStatus[outCap - 1] = 0;
+  }
+  if (!appSettings.apiBaseUrl[0] || !employeeId || !employeeId[0]) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (ESP.getFreeHeap() < ATTN_MIN_HEAP) {
+    Serial.printf("[API] attn skip low heap=%u\n", ESP.getFreeHeap());
+    return false;
   }
 
-  String url = String(appSettings.apiBaseUrl) + "/api/finger/arduino/attendance";
+  // Paksa http:// — HTTPS di ESP32+BLE sering panic/reboot.
+  char urlNorm[192];
+  if (strncmp(appSettings.apiBaseUrl, "https://", 8) == 0) {
+    snprintf(urlNorm, sizeof(urlNorm), "http://%s/api/finger/arduino/attendance",
+             appSettings.apiBaseUrl + 8);
+  } else if (strncmp(appSettings.apiBaseUrl, "http://", 7) == 0) {
+    snprintf(urlNorm, sizeof(urlNorm), "%s/api/finger/arduino/attendance", appSettings.apiBaseUrl);
+  } else {
+    snprintf(urlNorm, sizeof(urlNorm), "http://%s/api/finger/arduino/attendance",
+             appSettings.apiBaseUrl);
+  }
 
-  DynamicJsonDocument body(256);
-  body["employeeId"] = employeeId;
-  body["device_id"] = appSettings.deviceId;
-  body["kode_cabang"] = appSettings.kodeCabang;
-  // NTP time as YYYY-MM-DDTHH:MM:SS
+  char host[80], path[120];
+  uint16_t port = 80;
+  if (!attnParseUrl(urlNorm, host, sizeof(host), &port, path, sizeof(path))) {
+    Serial.println("[API] attn bad url");
+    return false;
+  }
+
+  char timeField[40] = "";
+  if (timeIso && timeIso[0]) {
+    strncpy(timeField, timeIso, sizeof(timeField) - 1);
+  } else {
+    snprintf(timeField, sizeof(timeField), "%s", "1970-01-01T00:00:00");
+  }
+
+  char body[220];
+  snprintf(body, sizeof(body),
+           "{\"employeeId\":\"%.36s\",\"device_id\":\"%.30s\",\"kode_cabang\":\"%.14s\",\"time\":\"%.36s\"}",
+           employeeId, appSettings.deviceId, appSettings.kodeCabang, timeField);
+  size_t bodyLen = strlen(body);
+
+  if (!httpsLock(1500)) {
+    Serial.println("[API] attn lock busy");
+    return false;
+  }
+
+  bool ok = false;
+  int httpCode = -1;
+  char respBuf[280];
+  respBuf[0] = 0;
+
+  // Pastikan socket lama tertutup sebelum connect baru.
+  if (attnClient.connected()) attnClient.stop();
+  vTaskDelay(pdMS_TO_TICKS(20));
+
+  Serial.printf("[API] attn DNS/connect %s:%u heap=%u\n", host, port, ESP.getFreeHeap());
+
+  IPAddress ip;
+  // hostByName bisa gagal — jangan biarkan hang tanpa batas.
+  unsigned long dnsT0 = millis();
+  bool dnsOk = WiFi.hostByName(host, ip);
+  if (!dnsOk || (millis() - dnsT0) > 2500) {
+    Serial.println("[API] attn DNS FAIL");
+    httpsUnlock();
+    return false;
+  }
+
+  attnClient.setTimeout(2);  // detik untuk read ops
+  if (!attnClient.connect(ip, port)) {
+    Serial.println("[API] attn connect FAIL");
+    attnClient.stop();
+    httpsUnlock();
+    return false;
+  }
+
+  // Tulis request — cek write gagal.
+  int w = 0;
+  w += attnClient.printf("POST %s HTTP/1.0\r\n", path);
+  w += attnClient.printf("Host: %s\r\n", host);
+  w += attnClient.print("Content-Type: application/json\r\n");
+  w += attnClient.printf("Content-Length: %u\r\n", (unsigned)bodyLen);
+  if (appSettings.apiKey[0]) {
+    w += attnClient.printf("X-Device-Key: %s\r\n", appSettings.apiKey);
+  }
+  w += attnClient.print("Connection: close\r\n\r\n");
+  w += attnClient.print(body);
+  if (w <= 0) {
+    Serial.println("[API] attn write FAIL");
+    attnClient.stop();
+    httpsUnlock();
+    return false;
+  }
+
+  unsigned long deadline = millis() + ATTN_HTTP_TIMEOUT_MS;
+  bool headersDone = false;
+  size_t respLen = 0;
+  char line[160];
+
+  while (millis() < deadline) {
+    if (!headersDone) {
+      if (!attnClient.available() && !attnClient.connected()) break;
+      if (!attnClient.available()) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        continue;
+      }
+      if (!attnReadLine(attnClient, line, sizeof(line), deadline)) break;
+      if (httpCode < 0 && strncmp(line, "HTTP/", 5) == 0) {
+        const char *sp = strchr(line, ' ');
+        if (sp) httpCode = atoi(sp + 1);
+      }
+      if (line[0] == 0) headersDone = true;
+      continue;
+    }
+    while (attnClient.available() && respLen + 1 < sizeof(respBuf)) {
+      int b = attnClient.read();
+      if (b < 0) break;
+      respBuf[respLen++] = (char)b;
+      respBuf[respLen] = 0;
+    }
+    if (!attnClient.available() && !attnClient.connected()) break;
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+
+  attnClient.stop();
+  httpsUnlock();
+
+  Serial.printf("[API] attn HTTP %d len=%u heap=%u\n",
+                httpCode, (unsigned)respLen, ESP.getFreeHeap());
+
+  if (httpCode < 200 || httpCode >= 300 || respLen == 0) return false;
+
+  // Ambil status dari JSON sederhana.
+  const char *key = strstr(respBuf, "\"status\"");
+  if (key) {
+    const char *q1 = strchr(key + 8, '"');
+    if (q1) {
+      const char *q2 = strchr(q1 + 1, '"');
+      if (q2 && q2 > q1 + 1 && outStatus && outCap > 1) {
+        size_t n = (size_t)(q2 - (q1 + 1));
+        if (n >= outCap) n = outCap - 1;
+        memcpy(outStatus, q1 + 1, n);
+        outStatus[n] = 0;
+        ok = true;
+      }
+    }
+  }
+  if (!ok && outStatus && outCap) {
+    strncpy(outStatus, "ok", outCap - 1);
+    ok = true;
+  }
+  return ok;
+}
+
+bool attnEnqueue(const char *employeeId, int pendingIdx) {
+  if (!attnQueue || !employeeId || !employeeId[0]) return false;
+  if (WiFi.status() != WL_CONNECTED || !appSettings.apiBaseUrl[0]) return false;
+  if (ESP.getFreeHeap() < ATTN_MIN_HEAP) return false;
+  if (attnUploading || uxQueueMessagesWaiting(attnQueue) > 0) {
+    Serial.println("[API] attendance skip: busy");
+    return false;
+  }
+  if (attnLastEmpId[0] && strcmp(attnLastEmpId, employeeId) == 0 &&
+      (millis() - attnLastQueuedAt) < ATTN_DEDUP_MS) {
+    // Duplikat 4s → tandai catatan lokal sebagai synced (sudah tercatat),
+    // supaya sync berkala TIDAK re-upload dan bikin absensi ganda di server.
+    if (pendingIdx >= 0 && pendingIdx < pendingAttCount) {
+      pendingAtt[pendingIdx].synced = true;
+      pendingAttSave();
+    }
+    attnPublishResult("ignored");
+    return true;
+  }
+
+  AttnJob job;
+  memset(&job, 0, sizeof(job));
+  strncpy(job.employeeId, employeeId, sizeof(job.employeeId) - 1);
+  job.pendingIdx = pendingIdx;
+  // waktu dari caller worker jika kosong — isi di sini
   String ntpTime = timeClient.getFormattedTime();
   unsigned long epoch = timeClient.getEpochTime();
-  struct tm *ti = localtime((time_t *)&epoch);
-  char timeBuf[24];
-  snprintf(timeBuf, sizeof(timeBuf), "%04d-%02d-%02dT%s",
-           ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday, ntpTime.c_str());
-  body["time"] = timeBuf;
-
-  String json;
-  serializeJson(body, json);
-
-  bool isHttps = url.startsWith("https://");
-  // Static/reused client — JANGAN new+delete tiap request. `http.end()`
-  // menutup koneksi tapi paket FIN/TLS close_notify masih diproses ASYNC
-  // oleh task WiFi driver (ppTask). Kalau objek client langsung di-delete
-  // (memori dibebaskan) sebelum proses async itu selesai, ppTask nanti
-  // baca memori yang sudah bebas → use-after-free → Guru Meditation
-  // LoadProhibited persis di ppTask/lmac* (root cause crash nyata
-  // 2026-08-06, konsisten dgn laporan komunitas arduino-esp32#3659).
-  static WiFiClientSecure attnSecureClient;
-  static WiFiClient attnPlainClient;
-  static bool attnSecureInit = false;
-  WiFiClient *client;
-  if (isHttps) {
-    if (!attnSecureInit) { attnSecureClient.setInsecure(); attnSecureInit = true; }
-    client = &attnSecureClient;
-  } else {
-    client = &attnPlainClient;
+  time_t et = (time_t)epoch;
+  struct tm *ti = localtime(&et);
+  if (ti) {
+    snprintf(job.timeBuf, sizeof(job.timeBuf), "%04d-%02d-%02dT%s",
+             ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday, ntpTime.c_str());
   }
 
-  HTTPClient http;
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(8000);
-  http.begin(*client, url);
-  http.addHeader("Content-Type", "application/json");
-  if (appSettings.apiKey[0]) http.addHeader("X-Device-Key", appSettings.apiKey);
-  lastScanActivity = millis();  // cegah watchdog selama HTTP
-  int code = http.POST(json);
-  String resp = "";
-  if (code > 0) {
-    resp = http.getString();
-    if (code < 200 || code >= 300) logError("attendance HTTP status=%d", code);
-  } else {
-    logError("attendance HTTP failed code=%d", code);
+  if (xQueueSend(attnQueue, &job, 0) != pdTRUE) return false;
+  strncpy(attnLastEmpId, employeeId, sizeof(attnLastEmpId) - 1);
+  attnLastEmpId[sizeof(attnLastEmpId) - 1] = 0;
+  attnLastQueuedAt = millis();
+  Serial.printf("[API] attendance queued %s\n", employeeId);
+  return true;
+}
+
+void attnWorker(void *param) {
+  (void)param;
+  AttnJob job;
+  for (;;) {
+    if (xQueueReceive(attnQueue, &job, portMAX_DELAY) != pdTRUE) continue;
+    attnUploading = true;
+    Serial.printf("[API] attendance upload %s...\n", job.employeeId);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    char st[24] = "error";
+    bool ok = postAttendanceSafe(job.employeeId, job.timeBuf, st, sizeof(st));
+    if (!ok) {
+      strncpy(st, "error", sizeof(st) - 1);
+      Serial.println("[API] attendance FAIL -> show error (no reboot)");
+    } else {
+      Serial.printf("[API] attendance OK status=%s\n", st);
+    }
+
+    // Update catatan lokal: sukses → synced=true (tidak di-retry).
+    // Gagal → tetap pending (di-retry sync berkala/manual).
+    if (job.pendingIdx >= 0 && job.pendingIdx < pendingAttCount) {
+      PendingAttendance &p = pendingAtt[job.pendingIdx];
+      p.synced = ok;
+      pendingAttSave();
+    }
+
+    // SELALU publish hasil — sukses maupun gagal. Jangan biarkan UI stuck MENGIRIM.
+    attnPublishResult(st);
+    attnUploading = false;
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
-  http.end();
-  lastScanActivity = millis();
-  return resp;
+}
+
+void attnServiceUi() {
+  // Timeout MENGIRIM: tampilkan GAGAL, jangan reboot.
+  if (attnSendingSince && (millis() - attnSendingSince) > ATTN_SENDING_TIMEOUT_MS &&
+      !attnResultPending) {
+    Serial.println("[API] sending UI timeout -> GAGAL KIRIM");
+    attnSendingSince = 0;
+    lcdShowAttendanceStatus("error");
+    attnUiClearAt = millis() + ATTN_FAIL_HOLD_MS;
+    // Jangan paksa attnUploading=false jika task masih jalan — biarkan selesai sendiri.
+  }
+
+  if (attnResultPending) {
+    noInterrupts();
+    attnResultPending = false;
+    char st[24];
+    strncpy(st, attnResultStatus, sizeof(st) - 1);
+    st[sizeof(st) - 1] = 0;
+    interrupts();
+
+    attnSendingSince = 0;
+    lcdShowAttendanceStatus(st);
+    ledcWrite(LCD_BL, 120);
+    bool fail = (strcmp(st, "error") == 0 || strcmp(st, "offline") == 0 ||
+                 strcmp(st, "not_found") == 0);
+    attnUiClearAt = millis() + (fail ? ATTN_FAIL_HOLD_MS : ATTN_RESULT_HOLD_MS);
+    if (!fail) emit(F("{\"event\":\"attendance\",\"ok\":true,\"status\":\"%s\"}"), st);
+    else emit(F("{\"event\":\"attendance\",\"ok\":false,\"status\":\"%s\"}"), st);
+  }
+
+  if (attnUiClearAt && millis() >= attnUiClearAt) {
+    attnUiClearAt = 0;
+    if (!enrollActive && scanState == SCAN_IDLE) lcdShowIdle();
+  }
+}
+
+void attnInit() {
+  if (!httpsMutex) httpsMutex = xSemaphoreCreateMutex();
+  if (attnQueue) return;
+  attnQueue = xQueueCreate(1, sizeof(AttnJob));
+  xTaskCreatePinnedToCore(attnWorker, "attnHttp", 12288, nullptr, 1, nullptr, 0);
+  Serial.println("[API] attendance upload task ready");
 }
 
 
@@ -1057,34 +1920,36 @@ String postRegister(const char *employeeId, uint8_t fingerId, const char *templa
 
   String url = String(appSettings.apiBaseUrl) + "/api/finger/arduino/register";
 
-  DynamicJsonDocument body(1536);
+  // JsonDocument (ArduinoJson 7) tumbuh di heap — jangan pakai pool 1536:
+  // template 256 byte = 512 hex, kalau pool penuh templateHex di-drop diam-diam
+  // dan server menyimpan marker ON_DEVICE (tidak bisa di-sync).
+  JsonDocument body;
   body["employeeId"] = employeeId;
   body["device_id"] = appSettings.deviceId;
   body["kode_cabang"] = appSettings.kodeCabang;
   body["finger_id"] = fingerId;
-  if (templateHex && templateHex[0]) body["templateHex"] = templateHex;
+  size_t hexLen = (templateHex && templateHex[0]) ? strlen(templateHex) : 0;
+  if (hexLen) body["templateHex"] = templateHex;
+  else logError("register without templateHex employee=%s", employeeId);
 
   String json;
   serializeJson(body, json);
-
-  bool isHttps = url.startsWith("https://");
-  // Static/reused client — lihat catatan di postAttendance() soal
-  // use-after-free saat client di-new/delete tiap request.
-  static WiFiClientSecure regSecureClient;
-  static WiFiClient regPlainClient;
-  static bool regSecureInit = false;
-  WiFiClient *client;
-  if (isHttps) {
-    if (!regSecureInit) { regSecureClient.setInsecure(); regSecureInit = true; }
-    client = &regSecureClient;
-  } else {
-    client = &regPlainClient;
+  if (hexLen && json.indexOf("templateHex") < 0) {
+    logError("register JSON omitted templateHex (len=%u)", (unsigned)hexLen);
+    return "";
   }
+  Serial.printf("[API] register hex_len=%u json_len=%u\n", (unsigned)hexLen, (unsigned)json.length());
 
+  WiFiClient *client = nullptr;
   HTTPClient http;
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(10000);
-  http.begin(*client, url);
+  if (!httpsLock(15000)) {
+    logError("register skipped: https busy");
+    return "";
+  }
+  if (!apiHttpBegin(http, client, url, 25000)) {
+    httpsUnlock();
+    return "";
+  }
   http.addHeader("Content-Type", "application/json");
   if (appSettings.apiKey[0]) http.addHeader("X-Device-Key", appSettings.apiKey);
   int code = http.POST(json);
@@ -1094,16 +1959,124 @@ String postRegister(const char *employeeId, uint8_t fingerId, const char *templa
     Serial.printf("[API] register HTTP %d: %s\n", code, resp.c_str());
     if (code < 200 || code >= 300) logError("register HTTP status=%d", code);
   } else {
-    Serial.printf("[API] register fail code=%d\n", code);
-    logError("register HTTP failed code=%d", code);
+    apiHttpLogError("register", http, code);
   }
   http.end();
+  httpsUnlock();
   return resp;
 }
 
 // ────────────────────────────────────────────────────────────────────
-//  WiFi Manager - power policy (3.3V panas jika radio selalu full)
+//  Sync worker — flush pending register + attendance belum ter-upload
 // ────────────────────────────────────────────────────────────────────
+// Dipicu oleh: timer berkala (uploadIntervalMinutes) & perintah SYNC_NOW
+// (BLE). Diproses di task terpisah supaya tidak memblokir loop utama.
+static QueueHandle_t syncQueue = nullptr;
+static volatile bool syncBusy = false;
+static volatile bool syncRequested = false;
+
+// Tandai ada pekerjaan sync (aman dipanggil dari task BLE / loop).
+void syncRequestNow() {
+  syncRequested = true;
+  if (syncQueue) {
+    uint8_t dummy = 1;
+    xQueueSend(syncQueue, &dummy, 0);
+  }
+}
+
+void syncWorker(void *param) {
+  (void)param;
+  for (;;) {
+    uint8_t dummy;
+    if (syncQueue && xQueueReceive(syncQueue, &dummy, portMAX_DELAY) != pdTRUE) continue;
+    if (!syncRequested) continue;
+    syncRequested = false;
+    if (syncBusy) continue;
+    syncBusy = true;
+    Serial.println("[SYNC] worker start");
+
+    if (WiFi.status() != WL_CONNECTED || !appSettings.apiBaseUrl[0]) {
+      Serial.println("[SYNC] offline — tetap simpan pending");
+      syncBusy = false;
+      continue;
+    }
+
+    // 1) Pending register (enroll yang belum ter-upload)
+    for (int i = 0; i < pendingRegCount && !enrollActive && !restoreActive; i++) {
+      PendingRegister &r = pendingReg[i];
+      if (!r.employeeId[0]) continue;
+      Serial.printf("[SYNC] register pending %s fid=%u\n", r.employeeId, r.fingerId);
+      String resp = postRegister(r.employeeId, r.fingerId, r.hex[0] ? r.hex : "");
+      bool ok = resp.length() > 0 && (resp.indexOf("\"status\":\"ok\"") >= 0 ||
+                                      resp.indexOf("\"status\":\"updated\"") >= 0);
+      if (ok) {
+        Serial.printf("[SYNC] register OK, remove pending %s\n", r.employeeId);
+        pendingRegRemove(i);
+        i--;
+        bleUpdateStatus();
+      } else {
+        Serial.printf("[SYNC] register fail — keep pending %s\n", r.employeeId);
+        vTaskDelay(pdMS_TO_TICKS(300));
+      }
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    // 2) Pending attendance (synced=false)
+    if (!enrollActive && !restoreActive) {
+      for (int i = 0; i < pendingAttCount; i++) {
+        PendingAttendance &p = pendingAtt[i];
+        if (p.synced || !p.employeeId[0]) continue;
+        char timeIso[32];
+        snprintf(timeIso, sizeof(timeIso), "%sT%s", p.tanggal, p.jam);
+        Serial.printf("[SYNC] attendance pending %s @%s\n", p.employeeId, timeIso);
+        char st[24] = "error";
+        bool ok = postAttendanceSafe(p.employeeId, timeIso, st, sizeof(st));
+        if (ok) {
+          p.synced = true;
+          pendingAttSave();
+          Serial.printf("[SYNC] attendance OK status=%s\n", st);
+        } else {
+          Serial.printf("[SYNC] attendance fail — keep pending %s\n", p.employeeId);
+          vTaskDelay(pdMS_TO_TICKS(300));
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+      }
+    }
+
+    Serial.println("[SYNC] worker done");
+    bleUpdateStatus();
+    syncBusy = false;
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+void syncInit() {
+  if (!httpsMutex) httpsMutex = xSemaphoreCreateMutex();
+  if (!pendingMutex) pendingMutex = xSemaphoreCreateMutex();
+  if (syncQueue) return;
+  syncQueue = xQueueCreate(1, sizeof(uint8_t));
+  xTaskCreatePinnedToCore(syncWorker, "syncHttp", 12288, nullptr, 1, nullptr, 0);
+  Serial.println("[SYNC] pending sync worker ready");
+}
+
+// Bangun JSON riwayat absensi lokal untuk BLE history char (4fafc208).
+void bleUpdateHistory() {
+  if (!pHistoryChar) return;
+  DynamicJsonDocument doc(ATTENDANCE_LOG_MAX * 120);
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < pendingAttCount; i++) {
+    JsonObject o = arr.createNestedObject();
+    o["employeeId"] = pendingAtt[i].employeeId;
+    o["nama"] = pendingAtt[i].nama;
+    o["tanggal"] = pendingAtt[i].tanggal;
+    o["jam"] = pendingAtt[i].jam;
+    o["synced"] = pendingAtt[i].synced;
+  }
+  String out;
+  serializeJson(doc, out);
+  pHistoryChar->setValue(out.c_str());
+}
+
 // Hanya TX power + flag. JANGAN ganti mode/AP di sini berkala —
 // itu memutus web UI (kesan "reboot") saat buka tab Setelan/WiFi.
 void wifiApplyPowerPolicy() {
@@ -1117,6 +2090,112 @@ void wifiApplyPowerPolicy() {
     wifiConnected = false;
     WiFi.setSleep(false);
   }
+}
+
+void wifiDnsStart() {
+  if (dnsServerActive) return;
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+  dnsServerActive = true;
+  Serial.printf("[WiFi] Captive DNS ON → %s\n", WiFi.softAPIP().toString().c_str());
+}
+
+void wifiDnsStop() {
+  if (!dnsServerActive) return;
+  dnsServer.stop();
+  dnsServerActive = false;
+  Serial.println("[WiFi] Captive DNS OFF");
+}
+
+// Tetap layani web/DNS saat operasi blocking (reinit sensor, dll) supaya AP
+// tidak "mati" dari sisi HP.
+void wifiServicePump() {
+  if (dnsServerActive) dnsServer.processNextRequest();
+  server.handleClient();
+  yield();
+}
+
+void pumpDelay(unsigned long ms) {
+  unsigned long t = millis();
+  while (millis() - t < ms) {
+    wifiServicePump();
+    delay(1);
+  }
+}
+
+// Pastikan AP setup hidup TANPA restart softAP (restart = putus client).
+void wifiEnsureApAlive() {
+  if (!wifiApSetupMode || !appSettings.apEnabled) return;
+  wifi_mode_t m = WiFi.getMode();
+  if (m != WIFI_AP_STA && m != WIFI_AP) {
+    WiFi.mode(WIFI_AP_STA);
+    pumpDelay(80);
+  }
+  if (WiFi.softAPIP() == IPAddress(0, 0, 0, 0)) {
+    WiFi.setSleep(false);
+    WiFi.softAP(AP_SSID, cred.apPass);
+    pumpDelay(50);
+    wifiDnsStart();
+    Serial.println("[WiFi] AP softAP restored (IP was 0)");
+  }
+}
+
+// Idle setup tanpa softAP — konfigurasi lewat BLE.
+void wifiEnterBleOnly(const char *reason) {
+  Serial.printf("[WiFi] BLE-only setup (%s) — softAP OFF\n", reason ? reason : "-");
+  wifiConnected = false;
+  wifiApSetupMode = true;
+  staIP = "";
+  wifiDnsStop();
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true);
+  delay(80);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  wifiApplyPowerPolicy();
+}
+
+// Mode AP setup — AP hidup untuk web UI, STA idle (tanpa WiFi.begin).
+// Pakai WIFI_AP_STA (bukan WIFI_AP murni) supaya scan jaringan bisa jalan.
+void wifiEnterApOnly(const char *reason) {
+  if (!appSettings.apEnabled) {
+    wifiEnterBleOnly(reason);
+    return;
+  }
+  Serial.printf("[WiFi] AP-setup mode (%s)\n", reason ? reason : "-");
+  wifiConnected = false;
+  wifiApSetupMode = true;
+  staIP = "";
+  // Putus usaha STA tanpa hapus cred tersimpan
+  WiFi.disconnect(true);
+  delay(80);
+  WiFi.mode(WIFI_AP_STA);
+  delay(100);
+  WiFi.setSleep(false);
+  // softAP wajib setelah ganti mode — kalau tidak, client HP putus / scan gagal
+  WiFi.softAP(AP_SSID, cred.apPass);
+  delay(50);
+  wifiApplyPowerPolicy();
+  wifiDnsStart();
+  Serial.printf("[WiFi] AP: %s | IP %s — STA idle, siap scan/setup\n",
+                AP_SSID, WiFi.softAPIP().toString().c_str());
+}
+
+void wifiMarkStaConnected(const char *ssid) {
+  wifiConnected = true;
+  wifiApSetupMode = false;
+  wifiStaEverOk = true;
+  staIP = WiFi.localIP().toString();
+  if (ssid && ssid[0]) staSSID = String(ssid);
+  wifiDnsStop();
+  // Mode server = STA di LAN WiFi. Matikan softAP supaya tidak campur portal.
+  if (WiFi.getMode() != WIFI_STA) {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+  }
+  wifiApplyPowerPolicy();
+  Serial.printf("[WiFi] STA server mode SSID=%s IP=%s (AP off)\n",
+                staSSID.c_str(), staIP.c_str());
 }
 
 // Pause autoscan + refresh watchdog selama operasi WiFi blocking
@@ -1137,7 +2216,8 @@ void wifiOpsEnd(bool resumeAuto) {
   consecutiveErrors = 0;
   recoveryCount = 0;
   scanState = SCAN_IDLE;
-  scanCooldownUntil = millis() + 5000;
+  // Setelah WiFi ops: cooldown singkat saja (dulu 5s — terasa “mati” setelah scan/BLE).
+  scanCooldownUntil = millis() + 800;
   if (resumeAuto) autoScan = true;
 }
 
@@ -1151,16 +2231,29 @@ void wifiInit() {
   // 80MHz cukup untuk polling sensor 20Hz + web UI + HTTP; UART2 hardware
   // tidak terpengaruh clock CPU.
   setCpuFrequencyMhz(80);
+  WiFi.setSleep(false);
 
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.setSleep(false);  // sementara AP aktif untuk setup
-  WiFi.softAP(AP_SSID, cred.apPass);
-  Serial.printf("[WiFi] AP: %s | AP IP: 192.168.4.1\n", AP_SSID);
+  // BLE-first: jangan nyalakan softAP kecuali ap_enabled=true.
+  if (!appSettings.apEnabled) {
+    WiFi.mode(WIFI_STA);
+    WiFi.softAPdisconnect(true);
+    Serial.println("[WiFi] softAP disabled (BLE setup mode)");
+  } else {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(AP_SSID, cred.apPass);
+    Serial.printf("[WiFi] AP: %s | AP IP: 192.168.4.1\n", AP_SSID);
+  }
 
   if (savedWiFiCount == 0) {
-    Serial.println("[WiFi] No saved credentials, AP only");
-    wifiApplyPowerPolicy();
+    Serial.println("[WiFi] No saved credentials — setup mode");
+    wifiEnterApOnly("no-credentials");
     return;
+  }
+
+  if (appSettings.apEnabled && WiFi.getMode() != WIFI_AP_STA) {
+    WiFi.mode(WIFI_AP_STA);
+  } else if (!appSettings.apEnabled) {
+    WiFi.mode(WIFI_STA);
   }
 
   for (int i = 0; i < savedWiFiCount; i++) {
@@ -1174,21 +2267,20 @@ void wifiInit() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-      wifiConnected = true;
-      staIP = WiFi.localIP().toString();
-      staSSID = String(savedWiFi[i].ssid);
+      wifiMarkStaConnected(savedWiFi[i].ssid);
       WiFi.softAPdisconnect(true);
       WiFi.mode(WIFI_STA);
       wifiApplyPowerPolicy();
       Serial.printf("[WiFi] Connected to %s | IP: %s | STA\n", savedWiFi[i].ssid, staIP.c_str());
       return;
     }
-    WiFi.disconnect();
+    WiFi.disconnect(false);
+    delay(100);
   }
 
-  Serial.println("[WiFi] All saved networks failed, AP only");
+  Serial.println("[WiFi] All saved networks failed — setup mode (no background retry storm)");
   logError("WiFi init: all saved networks failed");
-  wifiApplyPowerPolicy();
+  wifiEnterApOnly("boot-connect-failed");
 }
 
 
@@ -1204,54 +2296,137 @@ String apiProxyPost(const char *path, const String &body, int &httpCode);
 // ────────────────────────────────────────────────────────────────────
 // Reset state agar watchdog/scan error tidak ESP.restart() tepat setelah enroll
 void enrollCleanupResumeScan() {
-  if (ledOn) { finger.LEDcontrol(false); ledOn = false; }
+  bleEnrollCancelRequested = false;
+  if (ledOn) {
+    uint8_t ledResult = finger.LEDcontrol(false);
+    if (ledResult != FINGERPRINT_OK) {
+      logError("LED OFF (enroll cleanup) failed code=%d", ledResult);
+    }
+    // SELALU reset ke false — walau perintah gagal, gate scan berikutnya
+    // harus bisa mencoba LEDcontrol(true) lagi. ledOn=true yang dipertahankan
+    // membuat scan tidak pernah menyalakan LED lagi (bug LED stuck).
+    ledOn = false;
+  }
+  ledOnSince = 0;
   flushRX();
-  delay(80);
+  delay(50);
   lastScanActivity = millis();
   lastRecoveryAttempt = millis();
+  lastLcdActivity = millis();
   recoveryCount = 0;
   consecutiveErrors = 0;
   scanState = SCAN_IDLE;
-  scanCooldownUntil = millis() + 1500;
+  // Langsung siap scan — jangan cooldown panjang setelah batal/selesai enroll
+  scanCooldownUntil = millis() + 200;
   fingerDown = false;
   autoScan = true;
   enrollActive = false;
+  fingerMustRelease = false;
+  // Reset gate supaya jari berikutnya langsung bisa scan
+  irGateOpen = false;
+  irDetSince = irClearSince = 0;
+  irGateCooldownUntil = 0;
+  if (lcdBacklightOn) ledcWrite(LCD_BL, 255);
   lcdShowIdle();
+  bleUpdateStatus();
+}
+
+// Batalkan enroll aktif (dari BLE). Return true jika dibatalkan.
+static bool enrollAbortIfCancelled(const char *where) {
+  if (!bleEnrollCancelRequested) return false;
+  bleEnrollCancelRequested = false;
+  Serial.printf("[ENROLL] cancelled at %s — resume autoscan\n", where ? where : "?");
+  lcdEnrollErr("DIBATALKAN");
+  emit(F("{\"event\":\"enroll_cancelled\"}"));
+  enrollCleanupResumeScan();
+  return true;
 }
 
 uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
   int p = -1;
+  if (bleEnrollCancelRequested) {
+    bleEnrollCancelRequested = false;
+    emit(F("{\"event\":\"enroll_cancelled\"}"));
+    enrollCleanupResumeScan();
+    return 0xFD;
+  }
   enrollActive = true;
   autoScan = false;
-  lastScanActivity = millis();  // cegah false watchdog selama enroll (bisa >20s)
+  lastScanActivity = millis();
+  // Mode enroll: LCD + LED FPM10A menyala terus sampai 2 scan selesai / batal.
+  enrollKeepAliveUi();
   flushRX();
+
+  // id=0 → auto-assign slot kosong (dipakai jalur BLE). Harus dialokasikan
+  // sebelum waitNoFinger supaya storeModel(id) tidak menulis ke slot 0.
+  if (id == 0) {
+    id = nextFreeFingerId();
+    if (id == 0) {
+      logError("enroll auto-assign failed: full");
+      enrollCleanupResumeScan();
+      return 0xFE;
+    }
+  }
 
   lcdShowEnrollTitle(id);
   lcdEnrollStep("Remove finger", -1, "Clear sensor first", COL_TEXT);
   emit(F("{\"event\":\"enroll_start\",\"id\":%d}"), id);
-  if (!waitNoFinger()) { logError("enroll timeout waiting for no finger"); lcdEnrollErr("TIMEOUT"); emit(F("{\"event\":\"enroll_fail\",\"code\":-1}")); enrollCleanupResumeScan(); return 0xFE; }
+  enrollKeepAliveUi();
+  if (!waitNoFinger()) {
+    if (enrollAbortIfCancelled("wait_clear")) return 0xFD;
+    logError("enroll timeout waiting for no finger");
+    lcdEnrollErr("TIMEOUT");
+    emit(F("{\"event\":\"enroll_fail\",\"code\":-1}"));
+    enrollCleanupResumeScan();
+    return 0xFE;
+  }
+
+  enrollLedKeepOn();
+  delay(200);
 
   for (int attempt = 0; attempt < 3; attempt++) {
+    if (enrollAbortIfCancelled("loop")) return 0xFD;
     lastScanActivity = millis();
     lcdEnrollStep("Place finger", 10, "Touch sensor gently", COL_WARN);
     emit(F("{\"event\":\"waiting_finger\"}"));
-    finger.LEDcontrol(true); delay(200); ledOn = true;
-    if (!waitFinger()) { logError("enroll timeout waiting for finger step=1"); finger.LEDcontrol(false); ledOn = false; lcdEnrollErr("TIMEOUT"); emit(F("{\"event\":\"enroll_fail\",\"code\":-1}")); enrollCleanupResumeScan(); return 0xFE; }
+    enrollKeepAliveUi();
+    if (!waitFinger()) {
+      if (enrollAbortIfCancelled("finger1")) return 0xFD;
+      logError("enroll timeout waiting for finger step=1");
+      lcdEnrollErr("TIMEOUT");
+      emit(F("{\"event\":\"enroll_fail\",\"code\":-1}"));
+      enrollCleanupResumeScan();
+      return 0xFE;
+    }
 
     lcdEnrollStep("Capturing...", 25, "Reading fingerprint", COL_ACCENT);
+    enrollKeepAliveUi();
     flushRX(); delay(200);
+    // image2Tz/fingerSearch/createModel/storeModel bisa blocking >5s saat
+    // sensor lambat/macet → task WDT loop = reboot. Sama seperti scan path.
+    disableLoopWDT();
     p = finger.image2Tz(1);
+    enableLoopWDT();
+    esp_task_wdt_reset();
     if (p != FINGERPRINT_OK) {
       logError("enroll image2Tz step=1 failed code=%d", p);
       lcdEnrollErr("Bad Image #1");
       emit(F("{\"event\":\"bad_image\",\"step\":1,\"code\":%d}"), p);
-      if (!waitNoFinger()) { logError("enroll timeout after bad image step=1"); lcdEnrollErr("TIMEOUT"); enrollCleanupResumeScan(); return 0xFE; }
+      if (!waitNoFinger()) {
+        if (enrollAbortIfCancelled("bad1")) return 0xFD;
+        lcdEnrollErr("TIMEOUT");
+        enrollCleanupResumeScan();
+        return 0xFE;
+      }
       continue;
     }
     lcdEnrollStep("Step 1 OK", 40, "First scan captured", COL_OK);
     emit(F("{\"event\":\"image_ok_step1\"}"));
 
+    disableLoopWDT();
     p = finger.fingerSearch();
+    enableLoopWDT();
+    esp_task_wdt_reset();
     if (p == FINGERPRINT_OK) {
       char msg[32];
       snprintf(msg, sizeof(msg), "ID:%d exists", finger.fingerID);
@@ -1264,28 +2439,55 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
 
     lcdEnrollStep("Remove finger", 50, "Lift finger off sensor", COL_TEXT);
     emit(F("{\"event\":\"remove\"}"));
-    if (!waitNoFinger()) { logError("enroll timeout removing finger step=1"); lcdEnrollErr("TIMEOUT"); enrollCleanupResumeScan(); return 0xFE; }
+    enrollKeepAliveUi();
+    if (!waitNoFinger()) {
+      if (enrollAbortIfCancelled("remove1")) return 0xFD;
+      logError("enroll timeout removing finger step=1");
+      lcdEnrollErr("TIMEOUT");
+      enrollCleanupResumeScan();
+      return 0xFE;
+    }
 
     lcdEnrollStep("Place again", 60, "Same finger, same spot", COL_WARN);
     emit(F("{\"event\":\"waiting_finger_2\"}"));
-    finger.LEDcontrol(true); delay(200); ledOn = true;
-    if (!waitFinger()) { logError("enroll timeout waiting for finger step=2"); finger.LEDcontrol(false); ledOn = false; lcdEnrollErr("TIMEOUT"); emit(F("{\"event\":\"enroll_fail\",\"code\":-1}")); enrollCleanupResumeScan(); return 0xFE; }
+    enrollKeepAliveUi();
+    delay(LED_WARMUP_MS);
+    if (!waitFinger()) {
+      if (enrollAbortIfCancelled("finger2")) return 0xFD;
+      logError("enroll timeout waiting for finger step=2");
+      lcdEnrollErr("TIMEOUT");
+      emit(F("{\"event\":\"enroll_fail\",\"code\":-1}"));
+      enrollCleanupResumeScan();
+      return 0xFE;
+    }
 
     lcdEnrollStep("Capturing...", 75, "Reading fingerprint", COL_ACCENT);
+    enrollKeepAliveUi();
     flushRX(); delay(200);
+    disableLoopWDT();
     p = finger.image2Tz(2);
+    enableLoopWDT();
+    esp_task_wdt_reset();
     if (p != FINGERPRINT_OK) {
       logError("enroll image2Tz step=2 failed code=%d", p);
       lcdEnrollErr("Bad Image #2");
       emit(F("{\"event\":\"bad_image\",\"step\":2,\"code\":%d}"), p);
-      if (!waitNoFinger()) { logError("enroll timeout after bad image step=2"); lcdEnrollErr("TIMEOUT"); enrollCleanupResumeScan(); return 0xFE; }
+      if (!waitNoFinger()) {
+        if (enrollAbortIfCancelled("bad2")) return 0xFD;
+        lcdEnrollErr("TIMEOUT");
+        enrollCleanupResumeScan();
+        return 0xFE;
+      }
       continue;
     }
     lcdEnrollStep("Step 2 OK", 85, "Second scan captured", COL_OK);
     emit(F("{\"event\":\"image_ok_step2\"}"));
 
     lcdEnrollStep("Building model...", 90, "Matching patterns", COL_ACCENT);
+    disableLoopWDT();
     p = finger.createModel();
+    enableLoopWDT();
+    esp_task_wdt_reset();
     if (p == FINGERPRINT_OK) break;
 
     logError("enroll createModel failed code=%d attempt=%d", p, attempt + 1);
@@ -1293,7 +2495,12 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
     snprintf(msg, sizeof(msg), "Retry %d/3", attempt + 1);
     lcdEnrollErr(msg);
     emit(F("{\"event\":\"retry_create\",\"attempt\":%d}"), attempt + 1);
-    if (!waitNoFinger()) { logError("enroll timeout after createModel failure"); lcdEnrollErr("TIMEOUT"); enrollCleanupResumeScan(); return 0xFE; }
+    if (!waitNoFinger()) {
+      if (enrollAbortIfCancelled("retry")) return 0xFD;
+      lcdEnrollErr("TIMEOUT");
+      enrollCleanupResumeScan();
+      return 0xFE;
+    }
     if (attempt == 2) {
       lcdEnrollErr("Model FAILED");
       emit(F("{\"event\":\"enroll_fail\",\"code\":%d}"), p);
@@ -1302,9 +2509,14 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
     }
   }
 
+  if (enrollAbortIfCancelled("store")) return 0xFD;
+
   lcdEnrollStep("Storing...", 95, "Saving to sensor", COL_ACCENT);
   delay(100);
+  disableLoopWDT();
   p = finger.storeModel(id);
+  enableLoopWDT();
+  esp_task_wdt_reset();
   if (p != FINGERPRINT_OK) {
     logError("enroll storeModel failed id=%d code=%d", id, p);
     lcdEnrollErr("Store FAILED");
@@ -1315,25 +2527,46 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
 
   dbAdd(id, name, empId);
 
-  // Upload template hex ke server supaya bisa di-sync ke device lain.
-  // Sebelumnya di-skip di 3.3V karena diduga heap/brownout — root cause
-  // crash asli ternyata bug use-after-free WiFiClientSecure di HTTP client
-  // (sudah diperbaiki 2026-08-06), BUKAN soal ukuran payload. Sekarang aman
-  // diaktifkan, konsisten dengan versi 5V.
-  if (wifiConnected && empId && empId[0]) {
-    uint8_t tplBuf[256];
-    String hexStr = "";
-    if (getTemplateRaw(id, tplBuf)) {
-      hexStr = toHex(tplBuf, 256);
-    } else {
-      Serial.println("[API] getTemplateRaw failed — register tanpa hex");
+  // Ambil template hex supaya bisa di-upload ke server (sync ke device lain).
+  // SELALU simpan ke antrean pending_register.json — walau offline, akan
+  // di-upload saat sync berkala/manual (SYNC_NOW). Jika online langsung upload.
+  uint8_t tplBuf[256];
+  String hexStr = "";
+  if (empId && empId[0]) {
+    for (int t = 0; t < 3 && hexStr.length() < 512; t++) {
+      delay(t == 0 ? 80 : 200);
+      flushRX();
+      if (getTemplateRaw(id, tplBuf)) hexStr = toHex(tplBuf, 256);
+      Serial.printf("[API] getTemplateRaw try %d hex_len=%u\n", t + 1, (unsigned)hexStr.length());
     }
-    String regResp = postRegister(empId, id, hexStr.length() ? hexStr.c_str() : "");
-    if (regResp.length() > 0) {
-      emit(F("{\"event\":\"register_server\",\"ok\":true}"));
-      Serial.printf("[API] register resp: %s\n", regResp.c_str());
+    if (hexStr.length() < 512) {
+      logError("enroll register: template hex unavailable id=%d", id);
+    }
+    const char *hexC = hexStr.length() >= 512 ? hexStr.c_str() : "";
+    bool queued = pendingRegAdd(empId, id, hexC);
+    if (queued) {
+      Serial.println("[API] register queued pending (sync akan retry)");
+    }
+    if (wifiConnected) {
+      String regResp = postRegister(empId, id, hexC);
+      if (regResp.length() > 0) {
+        emit(F("{\"event\":\"register_server\",\"ok\":true,\"hex\":%s,\"status\":\"ok\"}"),
+             hexStr.length() >= 512 ? "true" : "false");
+        Serial.printf("[API] register resp: %s\n", regResp.c_str());
+        // sukses → hapus dari antrean pending
+        for (int i = 0; i < pendingRegCount; i++) {
+          if (strcmp(pendingReg[i].employeeId, empId) == 0 && pendingReg[i].fingerId == id) {
+            pendingRegRemove(i);
+            break;
+          }
+        }
+      } else {
+        emit(F("{\"event\":\"register_server\",\"ok\":false,\"hex\":%s,\"status\":\"error\"}"),
+             hexStr.length() >= 512 ? "true" : "false");
+      }
     } else {
-      emit(F("{\"event\":\"register_server\",\"response\":{\"status\":\"error\",\"message\":\"backend_unreachable\"}}"));
+      emit(F("{\"event\":\"register_server\",\"ok\":false,\"hex\":%s,\"status\":\"offline\"}"),
+           hexStr.length() >= 512 ? "true" : "false");
     }
   }
 
@@ -1341,7 +2574,7 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
   char msg[32];
   snprintf(msg, sizeof(msg), "ID:%d Enrolled", id);
   lcdEnrollOk(msg);
-  emit(F("{\"event\":\"enrolled\",\"id\":%d,\"name\":\"%s\"}"), id, name);
+  emit(F("{\"event\":\"enrolled\",\"id\":%d,\"name\":\"%s\"}"), id, jsonEscape(name));
   delay(2000);
 
   finger.getTemplateCount();
@@ -1378,8 +2611,6 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
 //      (putus feedback), lalu IR_GATE_COOLDOWN_MS sebelum evaluasi ulang.
 //   3. FALLBACK_POLL_MS: saat gate tutup, tetap poll getImage pelan-pelan
 //      sebagai jaring pengaman — scan tetap jalan walau gate gagal.
-bool irPolarityHigh = true;  // true = jari terdeteksi saat pin HIGH
-bool irCalibrated = false;
 
 void irCalibrate() {
   int hi = 0, lo = 0;
@@ -1387,25 +2618,37 @@ void irCalibrate() {
     if (digitalRead(TOUCH_PIN) == HIGH) hi++; else lo++;
     delay(25); yield();
   }
+
+  // Infer polaritas dari level idle. Boot sampling tanpa jari = stabil:
+  //  - idle HIGH (hi=20)  → sensor active-LOW (jari menarik pin ke LOW)
+  //  - idle LOW  (lo=20)  → sensor active-HIGH (jari menaikkan pin ke HIGH)
+  // Jangan anggap level idle stabil sebagai "sensor rusak" — itu NORMAL.
+  // Gate tetap dipakai; tanpa jari gate tertutup (LED mati), saat jari
+  // menyentuh pin berubah level → irRawDetected() true → LED nyala.
+  irFallbackMode = false;
   irPolarityHigh = (lo > hi);  // idle LOW → finger = HIGH, dan sebaliknya
   irCalibrated = true;
-  Serial.printf("[TOUCH] idle=%s → finger=%s\n", (lo > hi) ? "LOW" : "HIGH",
-                irPolarityHigh ? "HIGH" : "LOW");
+  irGateOpen = false;
+  irDetSince = irClearSince = 0;
+  irGateCooldownUntil = 0;
+  if (hi == 0 || lo == 0) {
+    // Sinyal tidak berubah saat boot — tetap pakai gate dengan polaritas
+    // ter-infer. Gate terbuka hanya saat level pin berubah (jari disentuh).
+    Serial.printf("[TOUCH] stable idle (hi=%d lo=%d) → finger=%s\n", hi, lo,
+                  irPolarityHigh ? "HIGH" : "LOW");
+  } else {
+    Serial.printf("[TOUCH] idle=%s → finger=%s\n", (lo > hi) ? "LOW" : "HIGH",
+                  irPolarityHigh ? "HIGH" : "LOW");
+  }
 }
 
 bool irRawDetected() {
-  if (!irCalibrated) return true;
+  if (!irCalibrated) return false;  // belum kalibrasi → jangan klaim ada jari
   bool lvl = (digitalRead(TOUCH_PIN) == HIGH);
   return irPolarityHigh ? lvl : !lvl;
 }
 
 // ── Gate state machine ────────────────────────────────────────────
-bool irGateOpen = false;
-unsigned long irDetSince = 0;        // sejak kapan IR terdeteksi kontinu
-unsigned long irClearSince = 0;      // sejak kapan IR kosong kontinu
-unsigned long irGateOpenedAt = 0;    // sejak kapan gate terbuka
-unsigned long irGateCooldownUntil = 0;
-unsigned long lastFallbackPoll = 0;
 const unsigned long IR_CONFIRM_MS = 100;
 const unsigned long IR_RELEASE_MS = 400;
 const unsigned long IR_GATE_TIMEOUT_MS = 3000;
@@ -1414,14 +2657,44 @@ const unsigned long FALLBACK_POLL_MS = 1500;
 
 void irUpdateGate() {
   if (!appSettings.irEnabled) {
+    irFallbackMode = false;
     irGateOpen = true;  // IR nonaktif → gate selalu terbuka (perilaku lama)
     irDetSince = irClearSince = 0;
     return;
   }
+  if (irFallbackMode) {
+    // Jangan pernah membiarkan gate terbuka permanen saat boot tidak ada sinyal.
+    // Ini menyebabkan LED FPM10A tetap nyala terus tanpa jari.
+    irGateOpen = false;
+    irDetSince = 0;
+    irClearSince = 0;
+    irGateCooldownUntil = 0;
+    return;
+  }
   bool raw = irRawDetected();
+  // Bangunkan LCD segera saat sentuhan mentah — jangan tunggu debounce gate
+  // (dulu layar bisa mati total sampai jari >5 detik karena cooldown gate).
+  if (raw) {
+    lastLcdActivity = millis();
+    lcdBacklightOn = true;
+    ledcWrite(LCD_BL, 255);
+    // Saat ada sentuhan valid, nyalakan LED segera — jangan menunggu gate
+    // sepenuhnya terbuka dulu, supaya lampu sensor menyala saat jari disentuh.
+    if (!ledOn && sensorReady) {
+      uint8_t r = finger.LEDcontrol(true);
+      bool ok = (r == FINGERPRINT_OK);
+      ledOn = ok;
+      ledOnSince = ok ? millis() : 0;
+      if (!ok) {
+        logError("LED ON (raw touch) failed code=%d", r);
+      }
+    }
+  }
   if (raw) {
     irClearSince = 0;
     if (!irGateOpen) {
+      // Jari masih menempel saat cooldown → batalkan cooldown (hindari tunggu >5s).
+      if (millis() < irGateCooldownUntil) irGateCooldownUntil = 0;
       if (!irDetSince) irDetSince = millis();
       else if (millis() - irDetSince >= IR_CONFIRM_MS) {
         irGateOpen = true;
@@ -1447,8 +2720,6 @@ void irUpdateGate() {
     irGateOpenedAt = irDetSince = irClearSince = 0;
     logDebug("GATE timeout");
   }
-  // Cooldown: jangan buka gate lagi selama periode cooldown
-  if (!irGateOpen && millis() < irGateCooldownUntil) irDetSince = 0;
 }
 
 bool irGateActive() { return irGateOpen; }
@@ -1461,14 +2732,49 @@ bool irShouldPoll() {
 }
 
 void checkAutoSleep() {
+  static bool prevSleeping = false;
   if (!timeClient.isTimeSet()) { scanSleeping = false; return; }
+  if (!appSettings.scanSchedule) { scanSleeping = false; return; }
   int h = timeClient.getHours();
-  scanSleeping = (h >= 0 && h < 5);
+  uint8_t a = appSettings.scanStartHour;
+  uint8_t b = appSettings.scanEndHour;
+  bool active;
+  if (a == b) {
+    active = true;  // start==end → selalu scan
+  } else if (a < b) {
+    active = (h >= (int)a && h < (int)b);
+  } else {
+    // wrap midnight, mis. 5→0 = aktif 05–23
+    active = (h >= (int)a || h < (int)b);
+  }
+  scanSleeping = !active;
+  // Transisi tidur → bangun: reset lastScanActivity supaya watchdog tidak
+  // langsung menganggap sensor mati (lastScanActivity basi sejak sebelum tidur).
+  if (prevSleeping && !scanSleeping) {
+    lastScanActivity = millis();
+    scanCooldownUntil = 0;
+    Serial.println("[SLEEP] Wake up — resume scan");
+    lcdShowIdle();
+  }
+  prevSleeping = scanSleeping;
+}
+
+static void ledForceOff(const char *reason) {
+  uint8_t ledResult = finger.LEDcontrol(false);
+  // Selalu reset state internal — walau perintah gagal, jangan mempertahankan
+  // ledOn=true yang membuat gate scan tidak pernah menyalakan LED lagi.
+  ledOn = false;
+  ledOnSince = 0;
+  if (ledResult == FINGERPRINT_OK) {
+    if (reason) logDebug("LED OFF (%s)", reason);
+  } else {
+    logError("LED OFF (%s) failed code=%d", reason ? reason : "?", ledResult);
+  }
 }
 
 void doAutoScan() {
-  static int fingerConfirm = 0;  // debounce: butuh 2x OK berturut
-  static const int FINGER_CONFIRM_NEEDED = 2;
+  static int fingerConfirm = 0;  // debounce counter (jangan dihapus — AGENTS.md)
+  static const int FINGER_CONFIRM_NEEDED = 1;  // 3V3: sensor lemah, tak sanggup 2x OK berturut
 
   switch (scanState) {
 
@@ -1479,31 +2785,78 @@ void doAutoScan() {
 
       irUpdateGate();
 
+      // Setelah scan: wajib angkat jari dulu. Scan ulang terlalu cepat (jari
+      // masih nempel / false OK) sering bikin image2Tz hang ~5s → loop macet
+      // (BLE enroll ikut tidak respons).
+      if (fingerMustRelease) {
+        bool clear = false;
+        if (appSettings.irEnabled && irCalibrated) {
+          clear = !irRawDetected();
+        } else {
+          clear = !irGateOpen;
+        }
+        if (clear) {
+          fingerMustRelease = false;
+          fingerConfirm = 0;
+          ledForceOff("release-ok");
+          irGateOpen = false;
+          irDetSince = irClearSince = 0;
+          irGateCooldownUntil = 0;
+          logDebug("SCAN ready — finger released");
+          // Jangan hapus layar MENGIRIM / hasil absensi.
+          if (!attnSendingSince && !attnUiClearAt) lcdShowIdle();
+        } else {
+          if (lcdBacklightOn) ledcWrite(LCD_BL, 90);  // jangan full 255 saat tunggu angkat jari
+          break;
+        }
+      }
+
+      // Jangan mulai scan baru saat MENGIRIM di layar.
+      // Timeout attnServiceUi → GAGAL KIRIM + buka kunci (tanpa reboot).
+      if (attnSendingSince) {
+        if (lcdBacklightOn) ledcWrite(LCD_BL, 90);
+        break;
+      }
+
       if (irGateOpen) {
-        // Gate terbuka — jari terdeteksi. Nyalakan LED + polling getImage.
         lastLcdActivity = millis();
         lcdBacklightOn = true;
         ledcWrite(LCD_BL, 255);
         if (!ledOn) {
-          finger.LEDcontrol(true);
-          ledOn = true;
+          uint8_t r = finger.LEDcontrol(true);
+          ledOn = (r == FINGERPRINT_OK);
+          ledOnSince = ledOn ? millis() : 0;
+          if (!ledOn) {
+            // Sensor masih error — jangan loop keras; tunggu gate cooldown.
+            logError("LED ON (gate) failed code=%d", r);
+            scanCooldownUntil = millis() + 500;
+            break;
+          }
           logDebug("LED ON");
           scanCooldownUntil = millis() + LED_WARMUP_MS;
-          break;  // non-blocking: skip getImage sampai LED stabil
+          break;
+        } else if (ledOnSince == 0) {
+          ledOnSince = millis();
+          scanCooldownUntil = millis() + LED_WARMUP_MS;
+          break;
+        } else if (appSettings.irEnabled && millis() - ledOnSince > LED_AUTO_OFF_MS) {
+          // Auto-off hanya untuk mode gate IR: gate terbuka lama tanpa hasil →
+          // tutup sementara. Saat ir_enabled=false (fallback polling) LED harus
+          // nyala stabil — mematikannya justru bikin kedip (gate langsung buka lagi).
+          ledForceOff("auto");
+          fingerConfirm = 0;
+          fingerMustRelease = true;
+          irGateOpen = false;
+          irDetSince = irClearSince = 0;
+          irGateCooldownUntil = 0;
+          scanCooldownUntil = millis() + 200;
+          break;
         }
       } else {
-        // Gate tertutup — standby. Skip getImage, hanya fallback ping.
         static unsigned long lastLedOffAttempt = 0;
         if (ledOn && (lastLedOffAttempt == 0 || millis() - lastLedOffAttempt >= LED_OFF_RETRY_MS)) {
           lastLedOffAttempt = millis();
-          uint8_t ledResult = finger.LEDcontrol(false);
-          if (ledResult == FINGERPRINT_OK) {
-            logDebug("LED OFF (standby)");
-            ledOn = false;
-          } else {
-            Serial.printf("[SCAN] LED OFF err: %d\n", ledResult);
-            logError("LED OFF failed code=%d", ledResult);
-          }
+          ledForceOff("standby");
         }
         if (lcdBacklightOn) ledcWrite(LCD_BL, 30);
         if (millis() - lastFallbackPoll >= FALLBACK_POLL_MS) {
@@ -1529,6 +2882,22 @@ void doAutoScan() {
         lastScanActivity = millis();
       }
 
+      if (p == FINGERPRINT_NOFINGER) {
+        // Saat gate IR aktif: jari lepas → matikan LED & tutup gate (hemat).
+        // Saat ir_enabled=false (fallback polling): jangan sentuh LED/gate —
+        // kalau dimatikan di sini lalu irUpdateGate() buka lagi tiap loop,
+        // LED jadi KEDIP terus. Biarkan LED nyala stabil selama polling.
+        if (appSettings.irEnabled && irCalibrated) {
+          ledForceOff("nofinger");
+          irGateOpen = false;
+          irDetSince = irClearSince = 0;
+          irGateCooldownUntil = millis() + 150;
+        }
+        fingerConfirm = 0;
+        fingerMustRelease = false;
+        break;
+      }
+
       if (p == FINGERPRINT_OK) {
         fingerConfirm++;
         if (fingerConfirm < FINGER_CONFIRM_NEEDED) {
@@ -1539,74 +2908,70 @@ void doAutoScan() {
         logDebug("SCAN image OK (debounce %d)", FINGER_CONFIRM_NEEDED);
         ledcWrite(LCD_BL, 255);
         scanState = SCAN_BUSY;
-        scanResultTime = millis();  // set awal: timeout safety jika image2Tz/fingerSearch hang
+        scanResultTime = millis();
         lcdShowScanning();
 
+        flushRX();
+        // image2Tz/fingerSearch bisa blocking >5s → task WDT loop = reboot.
+        disableLoopWDT();
         p = finger.image2Tz();
-        if (p != FINGERPRINT_OK) {
-          Serial.printf("[SCAN] image2Tz fail: %d\n", p);
-          logError("image2Tz failed code=%d", p);
+        if (p == FINGERPRINT_OK) p = finger.fingerSearch();
+        enableLoopWDT();
+        esp_task_wdt_reset();
+
+        if (p != FINGERPRINT_OK && p != FINGERPRINT_NOTFOUND) {
+          Serial.printf("[SCAN] image2Tz/search fail: %d\n", p);
+          logError("image2Tz/search failed code=%d", p);
           scanResultTime = millis();
-          scanCooldownUntil = millis() + 500;
+          fingerMustRelease = true;
+          scanCooldownUntil = millis() + 200;
+          ledForceOff("img-fail");
           scanState = SCAN_WAIT_RELEASE;
           return;
         }
 
-        p = finger.fingerSearch();
         if (p == FINGERPRINT_OK) {
           logDebug("SCAN match id=%d conf=%d", finger.fingerID, finger.confidence);
           const char *nm = dbGetName(finger.fingerID);
           const char *eid = dbGetEmpId(finger.fingerID);
           lcdShowMatch(finger.fingerID, finger.confidence, nm);
+          const char *nmE = jsonEscape(nm ? nm : "");
+          const char *eidE = jsonEscape(eid ? eid : "");
           emit(F("{\"event\":\"match\",\"id\":%d,\"confidence\":%d,\"name\":\"%s\",\"employeeId\":\"%s\"}"),
-               finger.fingerID, finger.confidence, nm, eid ? eid : "");
-          { char bbuf[128]; snprintf(bbuf, sizeof(bbuf),
-              "{\"event\":\"match\",\"id\":%d,\"confidence\":%d,\"name\":\"%s\",\"employeeId\":\"%s\"}",
-              finger.fingerID, finger.confidence, nm, eid ? eid : "");
-            bleNotifyEvent(bbuf); }
-          if (wifiConnected && eid && eid[0]) {
-            // JANGAN panggil WiFi.setTxPower() di sini — mengubah register
-            // PHY TX power sementara driver WiFi (task "ppTask") sedang
-            // aktif proses TX-queue/AMPDU/retry di packet lain menyebabkan
-            // race → korupsi state internal driver → crash LoadProhibited
-            // di ppTask (root cause bug nyata 2026-08-06 — jangan tambahkan
-            // lagi). Root cause crash asli sudah diperbaiki di level
-            // WiFiClientSecure (reuse client, tidak new/delete tiap
-            // request) — jadi cooldown di bawah cukup singkat.
-            String resp = postAttendance(eid);
-            if (resp.length() > 0) {
-              DynamicJsonDocument doc(512);
-              if (!deserializeJson(doc, resp)) {
-                const char *st = doc["status"] | "error";
-                lcdShowAttendanceStatus(st);
-              }
-              emit(F("{\"event\":\"attendance\",\"ok\":true}"));
-              Serial.printf("[API] attendance: %s\n", resp.c_str());
+               finger.fingerID, finger.confidence, nmE, eidE);
+          if (eid && eid[0]) {
+            ledForceOff("pre-attn");
+            ledcWrite(LCD_BL, 90);
+            // SELALU simpan dulu ke storage lokal (riwayat offline).
+            int paIdx = pendingAttAdd(eid, nm);
+            // Enqueue dulu. Gagal WiFi/queue → tampil OFFLINE/error, JANGAN reboot.
+            // Catatan tetap tersimpan (synced=false) dan di-upload saat sync.
+            if (WiFi.status() == WL_CONNECTED && attnEnqueue(eid, paIdx)) {
+              lcdShowAttendanceStatus("sending");
+              attnSendingSince = millis();
             } else {
-              lcdShowAttendanceStatus("error");
+              lcdShowAttendanceStatus(WiFi.status() == WL_CONNECTED ? "error" : "offline");
+              attnSendingSince = 0;
+              attnUiClearAt = millis() + ATTN_FAIL_HOLD_MS;
             }
-            flushRX();
+          } else {
+            ledForceOff("pre-attn");
           }
         } else {
           logDebug("SCAN nomatch code=%d", p);
           lcdShowNoMatch();
           emit(F("{\"event\":\"nomatch\",\"code\":%d}"), p);
-          { char bbuf[64]; snprintf(bbuf, sizeof(bbuf),
-              "{\"event\":\"nomatch\",\"code\":%d}", p);
-            bleNotifyEvent(bbuf); }
+          ledForceOff("nomatch");
         }
 
         scanResultTime = millis();
         lastScanActivity = millis();
         consecutiveErrors = 0;
         recoveryCount = 0;
-        scanCooldownUntil = millis() + 500;
+        fingerMustRelease = true;
+        scanCooldownUntil = millis() + 200;
         scanState = SCAN_WAIT_RELEASE;
-      } else if (p == FINGERPRINT_NOFINGER) {
-        consecutiveErrors = 0;
-        fingerConfirm = 0;
       } else {
-        // Transient UART error (sering setelah WiFi scan) — JANGAN ESP.restart()
         consecutiveErrors++;
         if (consecutiveErrors <= 3) {
           Serial.printf("[SCAN] getImage err: %d (x%d)\n", p, consecutiveErrors);
@@ -1617,36 +2982,31 @@ void doAutoScan() {
           Serial.printf("[SCAN] %d errors → soft recover (no reboot)\n", consecutiveErrors);
           logError("soft recover after %d getImage errors", consecutiveErrors);
           emit(F("{\"event\":\"sensor_soft_recover\"}"));
-          // Putus feedback LED dan reset gate segera, jangan tunggu timeout 3s.
-          uint8_t ledResult = finger.LEDcontrol(false);
-          ledOn = (ledResult != FINGERPRINT_OK);
-          if (ledOn) {
-            Serial.printf("[SCAN] LED OFF err: %d\n", ledResult);
-            logError("LED OFF during soft recover failed code=%d", ledResult);
-          }
+          ledForceOff("soft-recover");
           ledcWrite(LCD_BL, 30);
           irGateOpen = false;
           irGateCooldownUntil = millis() + SCAN_SOFT_RECOVER_MS;
           irGateOpenedAt = irDetSince = irClearSince = 0;
           fingerConfirm = 0;
+          fingerMustRelease = false;
           flushRX();
-          delay(300);
+          delay(200);
           flushRX();
           consecutiveErrors = 0;
           scanCooldownUntil = millis() + SCAN_SOFT_RECOVER_MS;
           lastScanActivity = millis();
         }
-        delay(150);
+        delay(80);
       }
       break;
     }
 
     case SCAN_BUSY:
-      // Safety: jika image2Tz/fingerSearch hang di 3.3V (UART stuck)
-      if (millis() - scanResultTime > 5000) {
+      if (millis() - scanResultTime > 3000) {
         logDebug("SCAN BUSY timeout — force reset");
         flushRX();
-        finger.LEDcontrol(false); ledOn = false;
+        ledForceOff("busy-timeout");
+        fingerMustRelease = true;
         scanState = SCAN_IDLE;
         consecutiveErrors = 0;
         fingerConfirm = 0;
@@ -1655,20 +3015,29 @@ void doAutoScan() {
       break;
 
     case SCAN_WAIT_RELEASE: {
-      // Timer 1.5 detik langsung lepas — jangan cek getImage() karena false positive
-      // di 3.3V sering return OK walau jari sudah diangkat
-      if (millis() - scanResultTime > 500) {
-        flushRX();
-        finger.LEDcontrol(false); ledOn = false;
-        logDebug("LED OFF (post-scan)");
-        irGateOpen = false;
-        irGateCooldownUntil = millis() + 200;
-        irGateOpenedAt = irDetSince = irClearSince = 0;
-        scanState = SCAN_IDLE;
-        consecutiveErrors = 0;
-        fingerConfirm = 0;
-        lcdShowIdle();
+      // Saat MENGIRIM: pantau timeout di attnServiceUi (→ GAGAL), jangan reboot.
+      if (attnSendingSince) {
+        if (lcdBacklightOn) ledcWrite(LCD_BL, 90);
+        lastScanActivity = millis();  // jangan picu watchdog
+        break;
       }
+      // Selalu kembali ke UI idle setelah hold — jangan stuck di MATCH/CHECK IN.
+      if (millis() - scanResultTime < SCAN_RESULT_HOLD_MS) break;
+
+      bool fingerGone = true;
+      if (appSettings.irEnabled && irCalibrated) {
+        fingerGone = !irRawDetected();
+      }
+      flushRX();
+      ledForceOff("post-scan");
+      irGateOpen = false;
+      irGateCooldownUntil = millis() + 150;
+      irGateOpenedAt = irDetSince = irClearSince = 0;
+      fingerMustRelease = !fingerGone;
+      scanState = SCAN_IDLE;
+      consecutiveErrors = 0;
+      fingerConfirm = 0;
+      if (!attnUiClearAt) lcdShowIdle();
       break;
     }
   }
@@ -1683,23 +3052,42 @@ extern const char INDEX_HTML[] PROGMEM;
 //  WEB API HANDLERS
 // ────────────────────────────────────────────────────────────────────
 void handleRoot() {
+  // HTML portal: di softAP / offline jangan Basic Auth (HP stuck 401).
+  // STA LAN tetap auth via requireAuth().
   if (!requireAuth()) return;
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "text/html", INDEX_HTML);
+  server.sendHeader("Cache-Control", "no-store");
+  // Jangan pakai server.send(const char*) — WebServer cast ke String; HTML ~47KB
+  // + heap tertekan NimBLE sering gagal ("String cast failed") → halaman blank.
+  // send_P stream dari flash tanpa alokasi full-copy.
+  server.send_P(200, PSTR("text/html"), INDEX_HTML);
 }
 
 void handleStatus() {
   if (!requireAuth()) return;
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  finger.getTemplateCount();
+  // Jangan sentuh UART sensor saat autoscan/enroll — bentrok getImage → PACKETRECIEVEERR.
+  static uint16_t cachedTplCount = 0;
+  if (!enrollActive && !restoreActive && scanState == SCAN_IDLE && !ledOn) {
+    if (finger.getTemplateCount() == FINGERPRINT_OK) {
+      cachedTplCount = finger.templateCount;
+    }
+  } else if (finger.templateCount > 0) {
+    cachedTplCount = finger.templateCount;
+  }
+  bool staOk = (WiFi.status() == WL_CONNECTED);
+  if (staOk) {
+    wifiConnected = true;
+    staIP = WiFi.localIP().toString();
+  }
   String json = "{\"ready\":" + String(sensorReady ? "true" : "false");
   json += ",\"autoActive\":" + String(autoScan ? "true" : "false");
-  json += ",\"count\":" + String(finger.templateCount);
+  json += ",\"count\":" + String(cachedTplCount);
   json += ",\"baud\":" + String(curBaud);
   json += ",\"security\":" + String(finger.security_level);
-  json += ",\"ip\":\"" + WiFi.softAPIP().toString() + "\"";
+  json += ",\"ip\":\"" + String(staOk ? staIP : WiFi.softAPIP().toString()) + "\"";
   json += ",\"clients\":" + String(WiFi.softAPgetStationNum());
-  json += ",\"wifiMode\":\"" + String(wifiConnected ? "STA" : "AP") + "\"";
+  json += ",\"wifiMode\":\"" + String(staOk ? "STA" : "AP") + "\"";
   json += ",\"staIP\":\"" + staIP + "\"";
   json += ",\"staSSID\":\"" + staSSID + "\"";
   json += ",\"apSSID\":\"" + String(AP_SSID) + "\"";
@@ -1715,8 +3103,11 @@ void handleStatus() {
 void handleCount() {
   if (!requireAuth()) return;
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  finger.getTemplateCount();
-  server.send(200, "application/json", "{\"ok\":true,\"count\":" + String(finger.templateCount) + "}");
+  uint16_t cnt = finger.templateCount;
+  if (!enrollActive && !restoreActive && scanState == SCAN_IDLE && !ledOn) {
+    if (finger.getTemplateCount() == FINGERPRINT_OK) cnt = finger.templateCount;
+  }
+  server.send(200, "application/json", "{\"ok\":true,\"count\":" + String(cnt) + "}");
 }
 
 void handleList() {
@@ -1751,9 +3142,8 @@ void handleEnroll() {
     return;
   }
 
-  finger.getTemplateCount();
-  uint8_t id = finger.templateCount + 1;
-  if (id > MAX_FP) {
+  uint8_t id = nextFreeFingerId();
+  if (id == 0) {
     server.send(507, "application/json", "{\"ok\":false,\"error\":\"full\"}");
     return;
   }
@@ -1813,7 +3203,11 @@ void handleAutoOff() {
   if (server.method() == HTTP_OPTIONS) { server.send(200); return; }
   if (!requireAuth()) return;
   autoScan = false;
-  if (ledOn) { finger.LEDcontrol(false); ledOn = false; }
+  if (ledOn) {
+    uint8_t ledResult = finger.LEDcontrol(false);
+    if (ledResult != FINGERPRINT_OK) logError("LED OFF (autooff) failed code=%d", ledResult);
+    ledOn = false;  // reset — walau gagal, jangan pertahankan state salah
+  }
   finger.getTemplateCount();
   lcdShowIdle();
   server.send(200, "application/json", "{\"ok\":true,\"autoActive\":false}");
@@ -1826,13 +3220,19 @@ void handleAutoOff() {
 void handleWifiStatus() {
   if (!requireAuth()) return;
   server.sendHeader("Access-Control-Allow-Origin", "*");
+  bool staOk = (WiFi.status() == WL_CONNECTED);
+  if (staOk) {
+    wifiConnected = true;
+    staIP = WiFi.localIP().toString();
+  }
   String json = "{";
-  json += "\"mode\":\"" + String(wifiConnected ? "STA" : "AP") + "\"";
-  json += ",\"connected\":" + String(wifiConnected ? "true" : "false");
+  json += "\"mode\":\"" + String(staOk ? "STA" : "AP") + "\"";
+  json += ",\"connected\":" + String(staOk ? "true" : "false");
   json += ",\"staIP\":\"" + staIP + "\"";
   json += ",\"staSSID\":\"" + staSSID + "\"";
   json += ",\"apSSID\":\"" + String(AP_SSID) + "\"";
   json += ",\"apIP\":\"192.168.4.1\"";
+  json += ",\"serverURL\":\"" + String(staOk ? ("http://" + staIP + "/") : "http://192.168.4.1/") + "\"";
   json += ",\"savedCount\":" + String(savedWiFiCount);
   json += ",\"saved\":[";
   for (int i = 0; i < savedWiFiCount; i++) {
@@ -1843,45 +3243,255 @@ void handleWifiStatus() {
   server.send(200, "application/json", json);
 }
 
+// Progressive scan: channel 1→13, merge ke list, UI poll dapat update live.
+// Area padat: 2 pass. Jangan softAP() ulang / scan blocking di HTTP handler.
+#define WIFI_SCAN_MAX 64
+#define WIFI_SCAN_PASSES 2
+struct WifiScanAp {
+  char ssid[33];
+  char bssid[18];
+  int8_t rssi;
+  uint8_t channel;
+  bool hidden;
+  bool enc;
+};
+static WifiScanAp wifiScanAps[WIFI_SCAN_MAX];
+static int wifiScanCount = 0;
+static uint8_t wifiScanPhase = 0; // 0 idle, 1 running, 2 done
+static uint8_t wifiScanNextCh = 1;
+static uint8_t wifiScanPass = 0;
+static unsigned long wifiScanStartMs = 0;
+static unsigned long wifiScanChStartMs = 0;
+static bool wifiScanWasAuto = false;
+
+static void wifiScanJsonEscape(const char *in, String &out) {
+  for (const char *p = in; *p; p++) {
+    if (*p == '\\' || *p == '"') out += '\\';
+    out += *p;
+  }
+}
+
+static void wifiScanMergeResults(int n) {
+  for (int i = 0; i < n; i++) {
+    String bssid = WiFi.BSSIDstr(i);
+    if (bssid.length() < 11) continue;
+    int idx = -1;
+    for (int j = 0; j < wifiScanCount; j++) {
+      if (bssid.equals(wifiScanAps[j].bssid)) {
+        idx = j;
+        break;
+      }
+    }
+    if (idx < 0) {
+      if (wifiScanCount >= WIFI_SCAN_MAX) continue;
+      idx = wifiScanCount++;
+      strncpy(wifiScanAps[idx].bssid, bssid.c_str(), sizeof(wifiScanAps[idx].bssid) - 1);
+      wifiScanAps[idx].bssid[sizeof(wifiScanAps[idx].bssid) - 1] = 0;
+      wifiScanAps[idx].rssi = -127;
+    }
+    String ssid = WiFi.SSID(i);
+    strncpy(wifiScanAps[idx].ssid, ssid.c_str(), sizeof(wifiScanAps[idx].ssid) - 1);
+    wifiScanAps[idx].ssid[sizeof(wifiScanAps[idx].ssid) - 1] = 0;
+    wifiScanAps[idx].hidden = (ssid.length() == 0);
+    int8_t rssi = (int8_t)WiFi.RSSI(i);
+    if (rssi > wifiScanAps[idx].rssi) wifiScanAps[idx].rssi = rssi;
+    wifiScanAps[idx].channel = (uint8_t)WiFi.channel(i);
+    wifiScanAps[idx].enc = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+  }
+}
+
+static void wifiScanSortByRssi() {
+  for (int i = 0; i < wifiScanCount; i++) {
+    for (int j = i + 1; j < wifiScanCount; j++) {
+      if (wifiScanAps[j].rssi > wifiScanAps[i].rssi) {
+        WifiScanAp t = wifiScanAps[i];
+        wifiScanAps[i] = wifiScanAps[j];
+        wifiScanAps[j] = t;
+      }
+    }
+  }
+}
+
+static String wifiScanBuildResponse(const char *status) {
+  wifiScanSortByRssi();
+  String json;
+  json.reserve((size_t)wifiScanCount * 140 + 80);
+  json += "{\"status\":\"";
+  json += status;
+  json += "\",\"channel\":";
+  json += String(wifiScanNextCh);
+  json += ",\"pass\":";
+  json += String(wifiScanPass + 1);
+  json += ",\"count\":";
+  json += String(wifiScanCount);
+  json += ",\"networks\":[";
+  for (int i = 0; i < wifiScanCount; i++) {
+    if (i > 0) json += ",";
+    json += "{\"ssid\":\"";
+    wifiScanJsonEscape(wifiScanAps[i].ssid, json);
+    json += "\",\"hidden\":";
+    json += wifiScanAps[i].hidden ? "true" : "false";
+    json += ",\"rssi\":";
+    json += String(wifiScanAps[i].rssi);
+    json += ",\"channel\":";
+    json += String(wifiScanAps[i].channel);
+    json += ",\"bssid\":\"";
+    json += wifiScanAps[i].bssid;
+    json += "\",\"enc\":";
+    json += wifiScanAps[i].enc ? "true" : "false";
+    json += "}";
+  }
+  json += "]}";
+  return json;
+}
+
+static bool wifiScanLaunchChannel(uint8_t ch) {
+  WiFi.scanDelete();
+  // async, show_hidden, active, dwell ms, single channel
+  int16_t r = WiFi.scanNetworks(true, true, false, 260, ch);
+  wifiScanChStartMs = millis();
+  Serial.printf("[WiFi] scan ch%d pass%d r=%d known=%d\n",
+                (int)ch, (int)wifiScanPass + 1, (int)r, wifiScanCount);
+  return r != WIFI_SCAN_FAILED;
+}
+
+static void wifiScanPrepareRadio() {
+  WiFi.setSleep(false);
+  if (appSettings.apEnabled) {
+    WiFi.mode(WIFI_AP_STA);
+    if (WiFi.softAPIP() == IPAddress(0, 0, 0, 0)) {
+      WiFi.softAP(AP_SSID, cred.apPass);
+      delay(60);
+    }
+  } else {
+    WiFi.mode(WIFI_STA);
+    WiFi.softAPdisconnect(true);
+  }
+  WiFi.disconnect(false);
+  delay(20);
+  wifi_country_t country = {};
+  strncpy(country.cc, "ID", sizeof(country.cc));
+  country.schan = 1;
+  country.nchan = 13;
+  country.max_tx_power = 78;
+  country.policy = WIFI_COUNTRY_POLICY_MANUAL;
+  esp_wifi_set_country(&country);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+}
+
+static void wifiScanFinish() {
+  if (wifiApSetupMode) WiFi.disconnect(false);
+  wifiEnsureApAlive();
+  wifiApplyPowerPolicy();
+  wifiOpsEnd(wifiScanWasAuto);
+  wifiScanPhase = 2;
+  Serial.printf("[WiFi] scan done total=%d\n", wifiScanCount);
+}
+
+// Mulai progressive scan (dipakai web UI + BLE). Return false jika busy/gagal.
+static bool wifiScanStart(const char *reason) {
+  if (wifiScanPhase == 1) return false;
+  if (cacheSyncBusy || attnUploading || httpsBusy) return false;
+  Serial.printf("[WiFi] progressive scan start (%s) mode=%d apSetup=%d\n",
+                reason ? reason : "?", (int)WiFi.getMode(), wifiApSetupMode ? 1 : 0);
+  wifiScanWasAuto = autoScan;
+  wifiOpsBegin();
+  wifiScanPrepareRadio();
+  wifiScanCount = 0;
+  wifiScanNextCh = 1;
+  wifiScanPass = 0;
+  wifiScanStartMs = millis();
+  wifiScanPhase = 1;
+  if (!wifiScanLaunchChannel(1)) {
+    wifiScanFinish();
+    return true; // selesai segera (kosong/gagal)
+  }
+  return true;
+}
+
+void wifiScanService() {
+  if (wifiScanPhase != 1) return;
+  int16_t st = WiFi.scanComplete();
+  if (st == WIFI_SCAN_RUNNING) {
+    if (millis() - wifiScanChStartMs > 4000) {
+      Serial.printf("[WiFi] scan ch%d timeout — skip\n", (int)wifiScanNextCh);
+      WiFi.scanDelete();
+      st = 0;
+    } else {
+      return;
+    }
+  }
+  if (st < 0 && st != WIFI_SCAN_FAILED) {
+    // unexpected
+    return;
+  }
+  if (st == WIFI_SCAN_FAILED) {
+    Serial.printf("[WiFi] scan ch%d failed — lanjut\n", (int)wifiScanNextCh);
+    WiFi.scanDelete();
+  } else if (st > 0) {
+    wifiScanMergeResults(st);
+    WiFi.scanDelete();
+  } else {
+    WiFi.scanDelete();
+  }
+
+  wifiScanNextCh++;
+  if (wifiScanNextCh > 13) {
+    wifiScanPass++;
+    if (wifiScanPass < WIFI_SCAN_PASSES) {
+      wifiScanNextCh = 1;
+      Serial.printf("[WiFi] scan pass %d/%d\n", wifiScanPass + 1, WIFI_SCAN_PASSES);
+    } else {
+      wifiScanFinish();
+      return;
+    }
+  }
+  if (millis() - wifiScanStartMs > 45000) {
+    Serial.println("[WiFi] scan global timeout");
+    wifiScanFinish();
+    return;
+  }
+  if (!wifiScanLaunchChannel(wifiScanNextCh)) {
+    // gagal start — coba channel berikutnya di loop berikutnya
+    wifiScanChStartMs = millis() - 3500;
+  }
+}
+
 void handleWifiScan() {
   if (!requireAuth()) return;
   server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "no-store");
 
-  // Scan RF blocking — pause autoscan, jangan langsung resume tanpa cooldown
-  bool wasAuto = autoScan;
-  wifiOpsBegin();
-
-  wifi_mode_t prevMode = WiFi.getMode();
-  // ESP32: scan lebih stabil di AP_STA; WIFI_STA-only sering putus + error sensor
-  if (prevMode == WIFI_STA) {
-    WiFi.mode(WIFI_AP_STA);
-    delay(50);
+  if (cacheSyncBusy || attnUploading || httpsBusy) {
+    server.send(200, "application/json",
+                "{\"status\":\"busy\",\"count\":0,\"networks\":[],\"error\":\"https_busy\"}");
+    return;
   }
 
-  int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/false);
-  if (n < 0) n = 0;
-  if (n > 15) n = 15;  // batasi heap JSON
+  wifiScanService();
 
-  String json = "[";
-  for (int i = 0; i < n; i++) {
-    if (i > 0) json += ",";
-    String ssid = WiFi.SSID(i);
-    ssid.replace("\\", "\\\\");
-    ssid.replace("\"", "\\\"");
-    json += "{\"ssid\":\"" + ssid + "\"";
-    json += ",\"rssi\":" + String(WiFi.RSSI(i));
-    json += ",\"enc\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false");
-    json += "}";
+  // Live progress: selalu kirim networks yang sudah terkumpul
+  if (wifiScanPhase == 1) {
+    server.send(200, "application/json", wifiScanBuildResponse("scanning"));
+    return;
   }
-  json += "]";
-  WiFi.scanDelete();
+  if (wifiScanPhase == 2) {
+    server.send(200, "application/json", wifiScanBuildResponse("done"));
+    wifiScanPhase = 0;
+    return;
+  }
 
-  if (prevMode == WIFI_STA && WiFi.status() == WL_CONNECTED) {
-    WiFi.mode(WIFI_STA);
+  if (!wifiScanStart("web")) {
+    server.send(200, "application/json",
+                "{\"status\":\"busy\",\"count\":0,\"networks\":[],\"error\":\"busy\"}");
+    return;
   }
-  wifiApplyPowerPolicy();
-  wifiOpsEnd(wasAuto);
-  server.send(200, "application/json", json);
+  if (wifiScanPhase == 2) {
+    server.send(200, "application/json", wifiScanBuildResponse("done"));
+    wifiScanPhase = 0;
+    return;
+  }
+  server.send(200, "application/json", wifiScanBuildResponse("scanning"));
 }
 
 void handleWifiSave() {
@@ -1919,10 +3529,18 @@ void handleWifiSave() {
   bool wasAuto = autoScan;
   wifiOpsBegin();
 
-  WiFi.mode(WIFI_AP_STA);
+  if (appSettings.apEnabled) {
+    // AP sudah aktif (mode AP) — jangan panggil softAP() lagi, itu merestart AP
+    // dan memutus client browser. Hanya aktifkan AP kalau saat ini STA-only.
+    if (WiFi.getMode() == WIFI_STA) {
+      WiFi.mode(WIFI_AP_STA);
+      WiFi.softAP(AP_SSID, cred.apPass);
+    }
+  } else {
+    WiFi.mode(WIFI_STA);
+    WiFi.softAPdisconnect(true);
+  }
   WiFi.setSleep(false);
-  // Pastikan AP tetap hidup selama connect supaya response ke browser (via AP) sampai
-  WiFi.softAP(AP_SSID, cred.apPass);
   WiFi.begin(ssid, pass);
 
   unsigned long start = millis();
@@ -1934,9 +3552,7 @@ void handleWifiSave() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    wifiConnected = true;
-    staIP = WiFi.localIP().toString();
-    staSSID = String(ssid);
+    wifiMarkStaConnected(ssid);
     server.send(200, "application/json",
       "{\"ok\":true,\"msg\":\"connected\",\"staIP\":\"" + staIP + "\",\"staSSID\":\"" + staSSID + "\"}");
     delay(300);  // biar TCP kirim response dulu
@@ -1945,12 +3561,12 @@ void handleWifiSave() {
     wifiApplyPowerPolicy();
     Serial.printf("[WiFi] Saved+connected %s | %s (no reboot)\n", ssid, staIP.c_str());
   } else {
-    wifiConnected = false;
+    // Gagal connect → tetap AP stabil, JANGAN biarkan STA terus scan
+    logError("WiFi save: connect failed for saved network");
+    wifiEnterApOnly("save-connect-failed");
     server.send(200, "application/json",
       "{\"ok\":true,\"msg\":\"saved_connect_failed\",\"mode\":\"AP\"}");
-    logError("WiFi save: connect failed for saved network");
-    wifiApplyPowerPolicy();
-    Serial.printf("[WiFi] Saved %s but connect failed — tetap AP\n", ssid);
+    Serial.printf("[WiFi] Saved %s but connect failed — tetap AP-only\n", ssid);
   }
 
   wifiOpsEnd(wasAuto);
@@ -1968,15 +3584,9 @@ void handleWifiReset() {
   bool wasAuto = autoScan;
   wifiOpsBegin();
   wifiClearCreds();
-  WiFi.disconnect(true);
-  delay(100);
-  WiFi.mode(WIFI_AP);
-  WiFi.setSleep(false);
-  WiFi.softAP(AP_SSID, cred.apPass);
-  wifiConnected = false;
-  staIP = "";
+  wifiStaEverOk = false;
+  wifiEnterApOnly("wifi-reset");
   staSSID = "";
-  wifiApplyPowerPolicy();
   server.send(200, "application/json", "{\"ok\":true,\"msg\":\"reset_ap_mode\"}");
   wifiOpsEnd(wasAuto);
   // Tidak ESP.restart() — cukup balik ke AP
@@ -2020,6 +3630,10 @@ void handleSettingsGet() {
   doc["device_id"] = appSettings.deviceId;
   doc["api_key"] = appSettings.apiKey;
   doc["ir_enabled"] = appSettings.irEnabled;
+  doc["scan_schedule"] = appSettings.scanSchedule;
+  doc["scan_start_hour"] = appSettings.scanStartHour;
+  doc["scan_end_hour"] = appSettings.scanEndHour;
+  doc["ap_enabled"] = appSettings.apEnabled;
   String json;
   serializeJson(doc, json);
   server.send(200, "application/json", json);
@@ -2039,63 +3653,814 @@ void handleSettingsSave() {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"bad_json\"}");
     return;
   }
-  if (doc.containsKey("apiBaseUrl")) strncpy(appSettings.apiBaseUrl, doc["apiBaseUrl"] | "", 127);
-  if (doc.containsKey("kode_cabang")) strncpy(appSettings.kodeCabang, doc["kode_cabang"] | "", 15);
-  if (doc.containsKey("device_id")) strncpy(appSettings.deviceId, doc["device_id"] | "", 31);
-  if (doc.containsKey("api_key")) strncpy(appSettings.apiKey, doc["api_key"] | "", 64);
+  bool httpsRewritten = false;
+  if (doc.containsKey("apiBaseUrl")) {
+    strncpy(appSettings.apiBaseUrl, doc["apiBaseUrl"] | "", 127);
+    appSettings.apiBaseUrl[127] = 0;
+    httpsRewritten = settingsNormalizeApiUrl(appSettings.apiBaseUrl, sizeof(appSettings.apiBaseUrl));
+  }
+  if (doc.containsKey("kode_cabang")) { strncpy(appSettings.kodeCabang, doc["kode_cabang"] | "", 15); appSettings.kodeCabang[15] = 0; }
+  if (doc.containsKey("device_id")) { strncpy(appSettings.deviceId, doc["device_id"] | "", 31); appSettings.deviceId[31] = 0; }
+  if (doc.containsKey("api_key")) { strncpy(appSettings.apiKey, doc["api_key"] | "", 64); appSettings.apiKey[64] = 0; }
   if (doc.containsKey("ir_enabled")) appSettings.irEnabled = doc["ir_enabled"] | true;
+  if (doc.containsKey("scan_schedule")) appSettings.scanSchedule = doc["scan_schedule"] | true;
+  if (doc.containsKey("scan_start_hour")) {
+    int h = doc["scan_start_hour"] | 5;
+    if (h < 0) h = 0; if (h > 23) h = 23;
+    appSettings.scanStartHour = (uint8_t)h;
+  }
+  if (doc.containsKey("scan_end_hour")) {
+    int h = doc["scan_end_hour"] | 0;
+    if (h < 0) h = 0; if (h > 23) h = 23;
+    appSettings.scanEndHour = (uint8_t)h;
+  }
+  if (doc.containsKey("ap_enabled")) appSettings.apEnabled = doc["ap_enabled"] | false;
+  if (doc.containsKey("upload_interval_minutes")) {
+    int v = doc["upload_interval_minutes"] | 120;
+    if (v < 5) v = 5; if (v > 1440) v = 1440;
+    appSettings.uploadIntervalMinutes = (uint16_t)v;
+  }
   if (!settingsSave()) {
     server.send(500, "application/json", "{\"ok\":false,\"error\":\"settings_save_failed\"}");
     return;
   }
-  server.send(200, "application/json", "{\"ok\":true,\"msg\":\"saved\"}");
+  if (httpsRewritten) {
+    Serial.printf("[SET] apiBaseUrl https->http: %s\n", appSettings.apiBaseUrl);
+  }
+  DynamicJsonDocument out(384);
+  out["ok"] = true;
+  out["msg"] = httpsRewritten ? "saved_http_rewrite" : "saved";
+  out["https_rewritten"] = httpsRewritten;
+  out["apiBaseUrl"] = appSettings.apiBaseUrl;
+  String json;
+  serializeJson(out, json);
+  server.send(200, "application/json", json);
 }
 
 // ────────────────────────────────────────────────────────────────────
 //  API Proxy - Branches & Employees from backend
 // ────────────────────────────────────────────────────────────────────
+// Baca body lewat decoder bawaan HTTPClient (writeToStream).
+// JANGAN baca raw getStreamPtr() sendiri: tanpa collectHeaders(), header
+// Transfer-Encoding tidak terlihat → framing chunk (mis. "22f\\n{...}\\n0")
+// bocor ke JSON dan bikin parse gagal di web UI.
+String apiReadBody(HTTPClient &http) {
+  StreamString body;
+  int sz = http.getSize();  // -1 jika chunked / tanpa Content-Length
+  if (sz > 0) body.reserve((size_t)sz + 1);
+  else body.reserve(56000);  // CKS employees ~49KB
+  int n = http.writeToStream(&body);
+  if (n < 0) {
+    Serial.printf("[API] writeToStream error %d\n", n);
+    logError("API body read error=%d", n);
+    return "";
+  }
+  return body;
+}
+
+// Stream body backend → browser tanpa full-buffer di RAM (penting untuk
+// /employees cabang besar seperti CKS/Malang ~49KB + NimBLE).
+class WebForwardStream : public Stream {
+public:
+  size_t write(uint8_t c) override {
+    char ch = (char)c;
+    server.sendContent(&ch, 1);
+    return 1;
+  }
+  size_t write(const uint8_t *buffer, size_t size) override {
+    if (!buffer || !size) return 0;
+    server.sendContent((const char *)buffer, size);
+    return size;
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+};
+
+// Tulis respons HTTP langsung ke File (cache LittleFS) — hemat RAM.
+class FileWriteStream : public Stream {
+  File *f;
+public:
+  explicit FileWriteStream(File *file) : f(file) {}
+  size_t write(uint8_t c) override { return f ? f->write(c) : 0; }
+  size_t write(const uint8_t *buffer, size_t size) override {
+    return (f && buffer && size) ? f->write(buffer, size) : 0;
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override { if (f) f->flush(); }
+};
+
+// ── Cache daftar cabang/karyawan di LittleFS ─────────────────────────
+// Enroll UI baca dari cache (cepat). Sync API berkala / tombol Refresh.
+#define CACHE_DIR "/cache"
+#define CACHE_BRANCHES "/cache/branches.json"
+#define CACHE_META "/cache/meta.json"
+#define CACHE_REFRESH_MS (30UL * 60UL * 1000UL)  // 30 menit
+// cacheSyncBusy dideklarasikan di atas (WiFi scan guard)
+unsigned long lastCacheSyncMs = 0;
+
+bool cacheEnsureDir() {
+  if (!storageReady) return false;
+  if (LittleFS.exists(CACHE_DIR)) return true;
+  return LittleFS.mkdir(CACHE_DIR);
+}
+
+String cacheEmpPath(const String &kode) {
+  String safe;
+  for (size_t i = 0; i < kode.length(); i++) {
+    char c = kode.charAt(i);
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == '_' || c == '-')
+      safe += c;
+  }
+  if (!safe.length()) safe = "ALL";
+  return String(CACHE_DIR) + "/emp_" + safe + ".json";
+}
+
+String cacheEmpSlimPath(const String &kode) {
+  String p = cacheEmpPath(kode);
+  p.replace(".json", ".slim.json");
+  return p;
+}
+
+// Job unduh karyawan async — cabang besar (Malang/CKS) jangan block HTTP 20–45s.
+char cacheEmpJobKode[24] = {0};
+volatile bool cacheEmpJobWanted = false;
+volatile bool cacheEmpJobFail = false;
+volatile bool cacheBranchesWanted = false;
+
+void cacheRequestEmployees(const String &kode) {
+  if (!kode.length() || kode == "__all__") return;
+  if (kode.length() >= (int)sizeof(cacheEmpJobKode)) return;
+  strncpy(cacheEmpJobKode, kode.c_str(), sizeof(cacheEmpJobKode) - 1);
+  cacheEmpJobKode[sizeof(cacheEmpJobKode) - 1] = 0;
+  cacheEmpJobFail = false;
+  cacheEmpJobWanted = true;
+  Serial.printf("[CACHE] emp job queued %s\n", cacheEmpJobKode);
+}
+
+bool cacheRefreshBranches();
+bool cacheRefreshEmployees(const String &kode);
+
+void cacheWorker(void *param) {
+  (void)param;
+  for (;;) {
+    if (enrollActive || restoreActive) {
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    if (cacheBranchesWanted && WiFi.status() == WL_CONNECTED && appSettings.apiBaseUrl[0]) {
+      cacheSyncBusy = true;
+      Serial.println("[CACHE] worker branches fetch");
+      cacheRefreshBranches();
+      cacheBranchesWanted = false;
+      cacheSyncBusy = false;
+      lastCacheSyncMs = millis();
+    }
+
+    if (cacheEmpJobWanted && WiFi.status() == WL_CONNECTED && appSettings.apiBaseUrl[0]) {
+      char kode[24];
+      strncpy(kode, cacheEmpJobKode, sizeof(kode) - 1);
+      kode[sizeof(kode) - 1] = 0;
+      cacheSyncBusy = true;
+      Serial.printf("[CACHE] worker emp start %s\n", kode);
+      bool ok = cacheRefreshEmployees(String(kode));
+      // Jangan clear wanted jika user sudah antre kode lain.
+      if (strncmp(cacheEmpJobKode, kode, sizeof(cacheEmpJobKode)) == 0) {
+        cacheEmpJobWanted = false;
+        cacheEmpJobFail = !ok;
+      }
+      cacheSyncBusy = false;
+      lastCacheSyncMs = millis();
+      Serial.printf("[CACHE] worker emp done %s ok=%d\n", kode, ok ? 1 : 0);
+    } else if (cacheEmpJobWanted && WiFi.status() != WL_CONNECTED) {
+      cacheEmpJobFail = true;
+      cacheEmpJobWanted = false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(150));
+  }
+}
+
+void cacheInitWorker() {
+  if (!httpsMutex) httpsMutex = xSemaphoreCreateMutex();
+  static bool started = false;
+  if (started) return;
+  started = true;
+  xTaskCreatePinnedToCore(cacheWorker, "cacheHttp", 12288, nullptr, 1, nullptr, 0);
+  Serial.println("[CACHE] download worker ready");
+}
+
+// Tick di loop utama: JANGAN fetch di sini (blocking). Worker yang jalan.
+void cacheEmpJobTick() {
+  // no-op — dibiarkan agar call site lama aman
+}
+
+void cacheBackgroundTick() {
+  if (cacheSyncBusy || cacheEmpJobWanted || cacheBranchesWanted) return;
+  if (enrollActive || restoreActive || attnUploading || httpsBusy) return;
+  if (!storageReady || !appSettings.apiBaseUrl[0]) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (lastCacheSyncMs != 0 && (millis() - lastCacheSyncMs) < CACHE_REFRESH_MS) return;
+  cacheBranchesWanted = true;
+  if (appSettings.kodeCabang[0]) {
+    cacheRequestEmployees(String(appSettings.kodeCabang));
+  }
+  Serial.println("[CACHE] background queued (worker)");
+}
+
+// Ambil array karyawan dari root [] atau {"data":[]}.
+static JsonArray empJsonArray(JsonDocument &doc) {
+  if (doc.is<JsonArray>()) return doc.as<JsonArray>();
+  if (doc["data"].is<JsonArray>()) return doc["data"].as<JsonArray>();
+  return JsonArray(); // invalid/empty
+}
+
+static void empJsonFilter(JsonDocument &filter) {
+  // Root array
+  filter[0]["id"] = true;
+  filter[0]["nama"] = true;
+  filter[0]["name"] = true;
+  filter[0]["finger_terdaftar"] = true;
+  // Wrapped { data: [ ... ] }
+  filter["data"][0]["id"] = true;
+  filter["data"][0]["nama"] = true;
+  filter["data"][0]["name"] = true;
+  filter["data"][0]["finger_terdaftar"] = true;
+}
+
+static const char *empNamaOf(JsonObject emp) {
+  const char *n = emp["nama"] | "";
+  if (n && n[0]) return n;
+  return emp["name"] | "";
+}
+
+// Buat file slim (id+nama, skip finger_terdaftar) supaya UI enroll cepat.
+bool cacheBuildEmpSlim(const String &kode) {
+  String src = cacheEmpPath(kode);
+  String dst = cacheEmpSlimPath(kode);
+  if (!LittleFS.exists(src)) return false;
+  File f = LittleFS.open(src, "r");
+  if (!f) return false;
+  size_t sz = f.size();
+  Serial.printf("[CACHE] slim build %s src=%u bytes heap=%u\n",
+                kode.c_str(), (unsigned)sz, (unsigned)ESP.getFreeHeap());
+
+  JsonDocument filter;
+  empJsonFilter(filter);
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, f, DeserializationOption::Filter(filter));
+  f.close();
+  if (err) {
+    Serial.printf("[CACHE] slim parse fail %s (%s) heap=%u\n",
+                  kode.c_str(), err.c_str(), (unsigned)ESP.getFreeHeap());
+    LittleFS.remove(dst);
+    return false;
+  }
+  JsonArray arr = empJsonArray(doc);
+  if (arr.isNull()) {
+    Serial.printf("[CACHE] slim no array %s\n", kode.c_str());
+    LittleFS.remove(dst);
+    return false;
+  }
+
+  String tmp = dst + ".tmp";
+  File o = LittleFS.open(tmp, "w");
+  if (!o) return false;
+  o.print('[');
+  bool first = true;
+  int kept = 0;
+  for (JsonObject emp : arr) {
+    if (emp["finger_terdaftar"] | false) continue;
+    if (!first) o.print(',');
+    first = false;
+    o.print("{\"id\":");
+    serializeJson(emp["id"], o);
+    o.print(",\"nama\":");
+    if (emp["nama"].isNull() && !emp["name"].isNull()) serializeJson(emp["name"], o);
+    else serializeJson(emp["nama"], o);
+    o.print('}');
+    kept++;
+    if ((kept & 31) == 0) yield();
+  }
+  o.print(']');
+  o.close();
+  LittleFS.remove(dst);
+  if (!LittleFS.rename(tmp, dst)) {
+    File a = LittleFS.open(tmp, "r");
+    File b = LittleFS.open(dst, "w");
+    if (a && b) {
+      uint8_t buf[512];
+      while (a.available()) {
+        int n = a.read(buf, sizeof(buf));
+        if (n > 0) b.write(buf, n);
+      }
+    }
+    if (a) a.close();
+    if (b) b.close();
+    LittleFS.remove(tmp);
+  }
+  Serial.printf("[CACHE] slim %s kept=%d\n", dst.c_str(), kept);
+  return LittleFS.exists(dst);
+}
+
+void cacheInvalidateEmpSlim(const String &kode) {
+  if (!kode.length()) return;
+  LittleFS.remove(cacheEmpSlimPath(kode));
+}
+
+unsigned long cacheEpochNow() {
+  if (timeClient.isTimeSet()) return timeClient.getEpochTime();
+  return millis() / 1000UL;
+}
+
+void cacheMetaSet(const char *key, unsigned long ts) {
+  if (!cacheEnsureDir() || !key || !key[0]) return;
+  JsonDocument doc;
+  File f = LittleFS.open(CACHE_META, "r");
+  if (f) { deserializeJson(doc, f); f.close(); }
+  doc[key] = ts;
+  f = LittleFS.open(CACHE_META, "w");
+  if (!f) return;
+  serializeJson(doc, f);
+  f.close();
+}
+
+unsigned long cacheMetaGet(const char *key) {
+  if (!storageReady || !LittleFS.exists(CACHE_META) || !key) return 0;
+  JsonDocument doc;
+  File f = LittleFS.open(CACHE_META, "r");
+  if (!f) return 0;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) return 0;
+  return (unsigned long)(doc[key] | 0);
+}
+
+bool sendLittleFSFile(const char *path, const char *cacheState) {
+  if (!storageReady || !LittleFS.exists(path)) return false;
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  size_t sz = f.size();
+  if (sz == 0) { f.close(); return false; }
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "no-store");
+  if (cacheState && cacheState[0]) server.sendHeader("X-Cache", cacheState);
+  // streamFile lebih andal untuk file besar (Malang ~49KB) vs sendContent loop
+  size_t n = server.streamFile(f, "application/json");
+  Serial.printf("[CACHE] stream %s bytes=%u sent=%u %s\n",
+                path, (unsigned)sz, (unsigned)n, cacheState ? cacheState : "");
+  return n > 0;
+}
+
+// Select2 async: baca slim/full cache, filter q, page/limit — respons kecil.
+bool sendEmployeesSelect2(const String &kode, const String &q, int page, int limit) {
+  if (!storageReady || !kode.length()) return false;
+  String spath = cacheEmpSlimPath(kode);
+  String cpath = cacheEmpPath(kode);
+  // Slim dulu (array kecil). Kalau belum ada, parse full + buat slim di belakang.
+  String path = LittleFS.exists(spath) ? spath : cpath;
+  if (!LittleFS.exists(path)) return false;
+
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  size_t sz = f.size();
+  Serial.printf("[S2] open %s bytes=%u heap=%u\n",
+                path.c_str(), (unsigned)sz, (unsigned)ESP.getFreeHeap());
+
+  JsonDocument filter;
+  empJsonFilter(filter);
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, f, DeserializationOption::Filter(filter));
+  f.close();
+  if (err) {
+    Serial.printf("[S2] parse fail %s (%s) heap=%u\n",
+                  kode.c_str(), err.c_str(), (unsigned)ESP.getFreeHeap());
+    // File corrupt / OOM — antre ulang cache
+    if (WiFi.status() == WL_CONNECTED && appSettings.apiBaseUrl[0]) {
+      cacheRequestEmployees(kode);
+    }
+    return false;
+  }
+  JsonArray arr = empJsonArray(doc);
+  if (arr.isNull()) {
+    Serial.printf("[S2] no employee array in %s\n", path.c_str());
+    // Mungkin format tak dikenal — coba rebuild slim dari full
+    if (path != cpath && LittleFS.exists(cpath)) {
+      // fall through by reopening full below
+    } else if (WiFi.status() == WL_CONNECTED) {
+      cacheRequestEmployees(kode);
+    }
+    // Retry once on full file if we opened slim that is wrong
+    if (path == spath && LittleFS.exists(cpath)) {
+      path = cpath;
+      f = LittleFS.open(path, "r");
+      if (!f) return false;
+      JsonDocument filter2;
+      empJsonFilter(filter2);
+      doc.clear();
+      err = deserializeJson(doc, f, DeserializationOption::Filter(filter2));
+      f.close();
+      if (err) {
+        Serial.printf("[S2] full parse fail %s (%s)\n", kode.c_str(), err.c_str());
+        return false;
+      }
+      arr = empJsonArray(doc);
+      if (arr.isNull()) return false;
+      // rebuild slim in background next worker cycle
+      cacheBuildEmpSlim(kode);
+    } else {
+      return false;
+    }
+  }
+
+  String qLower = q;
+  qLower.toLowerCase();
+  qLower.trim();
+  if (page < 1) page = 1;
+  if (limit < 1) limit = 30;
+  if (limit > 50) limit = 50;
+  int skip = (page - 1) * limit;
+
+  JsonDocument out;
+  out["ok"] = true;
+  JsonArray results = out["results"].to<JsonArray>();
+  int total = 0;
+  int matched = 0;
+  int sent = 0;
+  bool more = false;
+
+  for (JsonObject emp : arr) {
+    total++;
+    if (emp["finger_terdaftar"] | false) continue;
+    const char *idC = emp["id"] | "";
+    const char *namaC = empNamaOf(emp);
+    if (!idC[0]) continue;
+    if (qLower.length()) {
+      String idL = String(idC); idL.toLowerCase();
+      String namaL = String(namaC); namaL.toLowerCase();
+      if (idL.indexOf(qLower) < 0 && namaL.indexOf(qLower) < 0) continue;
+    }
+    if (matched++ < skip) continue;
+    if (sent >= limit) { more = true; break; }
+
+    JsonObject row = results.add<JsonObject>();
+    row["id"] = idC;
+    String text = String(namaC);
+    if (!text.length()) text = idC;
+    text += " (";
+    text += idC;
+    text += ")";
+    row["text"] = text;
+    row["nama"] = namaC;
+    sent++;
+    yield();
+  }
+
+  out["more"] = more;
+  out["page"] = page;
+  out["limit"] = limit;
+  out["matched"] = matched;
+  out["total"] = total;
+  out["kode_cabang"] = kode;
+  server.sendHeader("X-Cache", path.endsWith(".slim.json") ? "S2-SLIM" : "S2-FULL");
+  String json;
+  serializeJson(out, json);
+  server.send(200, "application/json", json);
+  Serial.printf("[S2] %s q='%s' page=%d sent=%d more=%d total=%d\n",
+                kode.c_str(), q.c_str(), page, sent, more ? 1 : 0, total);
+  return true;
+}
+
+bool apiProxyBeginGet(HTTPClient &http, WiFiClient *&client, const String &url, uint32_t timeoutMs) {
+  return apiHttpBegin(http, client, url, timeoutMs);
+}
+
+// Encode query component untuk proxy Select2 (nama/ID bisa spasi/non-ASCII).
+String urlEncodeComponent(const String &s) {
+  String out;
+  out.reserve(s.length() * 3);
+  static const char *hex = "0123456789ABCDEF";
+  for (size_t i = 0; i < s.length(); i++) {
+    uint8_t c = (uint8_t)s[i];
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+        c == '-' || c == '_' || c == '.' || c == '~') {
+      out += (char)c;
+    } else {
+      out += '%';
+      out += hex[c >> 4];
+      out += hex[c & 0x0F];
+    }
+  }
+  return out;
+}
+
+// Select2 live: proxy page kecil ke PJTKI (tanpa unduh full cache cabang).
+bool proxyEmployeesSelect2Live(const String &kode, const String &q, int page, int limit) {
+  if (!kode.length() || kode == "__all__") return false;
+  if (WiFi.status() != WL_CONNECTED || !appSettings.apiBaseUrl[0]) return false;
+  if (!httpsLock(15000)) {
+    server.send(503, "application/json",
+                "{\"ok\":false,\"error\":\"https_busy\",\"retry\":true,\"results\":[],\"more\":false}");
+    return true;
+  }
+
+  if (page < 1) page = 1;
+  if (limit < 1) limit = 30;
+  if (limit > 50) limit = 50;
+
+  String url = String(appSettings.apiBaseUrl) + "/api/finger/employees?select2=1"
+             + "&kode_cabang=" + urlEncodeComponent(kode)
+             + "&page=" + String(page)
+             + "&limit=" + String(limit)
+             + "&q=" + urlEncodeComponent(q);
+
+  WiFiClient *client = nullptr;
+  HTTPClient http;
+  if (!apiHttpBegin(http, client, url, 15000)) {
+    httpsUnlock();
+    return false;
+  }
+  if (appSettings.apiKey[0]) http.addHeader("X-Device-Key", appSettings.apiKey);
+  int httpCode = http.GET();
+  if (httpCode < 200 || httpCode >= 300) {
+    Serial.printf("[S2] live HTTP %d\n", httpCode);
+    logError("employees select2 live status=%d kode=%s", httpCode, kode.c_str());
+    http.end();
+    httpsUnlock();
+    return false;
+  }
+
+  String body = apiReadBody(http);
+  http.end();
+  httpsUnlock();
+
+  // Validasi minimal: harus punya results (format server baru)
+  if (!body.length() || body.indexOf("\"results\"") < 0) {
+    Serial.println("[S2] live bad body");
+    return false;
+  }
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("X-Cache", "LIVE");
+  server.send(200, "application/json", body);
+  Serial.printf("[S2] LIVE %s q='%s' page=%d bytes=%u\n",
+                kode.c_str(), q.c_str(), page, (unsigned)body.length());
+  return true;
+}
+
+// Unduh URL API → file LittleFS (stream, tanpa buffer penuh di RAM).
+bool cacheFetchToFile(const String &url, const String &path, int &httpCode) {
+  httpCode = -1;
+  if (!cacheEnsureDir() || !url.length() || !path.length()) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!httpsLock(60000)) {
+    logError("cache fetch https busy");
+    return false;
+  }
+
+  String tmp = path + ".tmp";
+  WiFiClient *client = nullptr;
+  HTTPClient http;
+  if (!apiHttpBegin(http, client, url, 45000)) {
+    httpsUnlock();
+    logError("cache fetch begin failed");
+    return false;
+  }
+  if (appSettings.apiKey[0]) http.addHeader("X-Device-Key", appSettings.apiKey);
+  httpCode = http.GET();
+  if (httpCode < 200 || httpCode >= 300) {
+    logError("cache fetch HTTP %d", httpCode);
+    http.end();
+    httpsUnlock();
+    return false;
+  }
+
+  File f = LittleFS.open(tmp, "w");
+  if (!f) {
+    http.end();
+    httpsUnlock();
+    logError("cache open tmp failed");
+    return false;
+  }
+  FileWriteStream out(&f);
+  int n = http.writeToStream(&out);
+  f.close();
+  http.end();
+  httpsUnlock();
+  if (n <= 0) {
+    LittleFS.remove(tmp);
+    logError("cache write failed n=%d", n);
+    return false;
+  }
+  LittleFS.remove(path);
+  if (!LittleFS.rename(tmp, path)) {
+    // fallback copy
+    File a = LittleFS.open(tmp, "r");
+    File b = LittleFS.open(path, "w");
+    if (a && b) {
+      uint8_t buf[512];
+      while (a.available()) {
+        int r = a.read(buf, sizeof(buf));
+        if (r > 0) b.write(buf, r);
+      }
+    }
+    if (a) a.close();
+    if (b) b.close();
+    LittleFS.remove(tmp);
+    if (!LittleFS.exists(path)) return false;
+  }
+  Serial.printf("[CACHE] saved %s (%d bytes)\n", path.c_str(), n);
+  return true;
+}
+
+bool cacheRefreshBranches() {
+  if (!appSettings.apiBaseUrl[0]) return false;
+  String url = String(appSettings.apiBaseUrl) + "/api/finger/branches";
+  int code = 0;
+  if (!cacheFetchToFile(url, CACHE_BRANCHES, code)) return false;
+  cacheMetaSet("branches", cacheEpochNow());
+  return true;
+}
+
+bool cacheRefreshEmployees(const String &kode) {
+  if (!appSettings.apiBaseUrl[0]) return false;
+  // Jangan cache "semua cabang" — payload bisa sangat besar.
+  if (!kode.length() || kode == "__all__") return false;
+  String path = cacheEmpPath(kode);
+  String url = String(appSettings.apiBaseUrl) + "/api/finger/employees?kode_cabang=" + kode;
+  int code = 0;
+  if (!cacheFetchToFile(url, path, code)) return false;
+  String metaKey = "emp_" + kode;
+  cacheMetaSet(metaKey.c_str(), cacheEpochNow());
+  cacheBuildEmpSlim(kode);
+  return true;
+}
+
+// Patch flag finger_terdaftar di file cache tanpa hit API (setelah enroll/hapus).
+bool cachePatchEmpFlagInFile(const String &path, const char *empId, bool registered) {
+  if (!storageReady || !empId || !empId[0] || !LittleFS.exists(path)) return false;
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  size_t sz = f.size();
+  if (sz == 0 || sz > 70000) { f.close(); return false; }
+  String data;
+  data.reserve(sz + 16);
+  uint8_t buf[512];
+  while (f.available()) {
+    int n = f.read(buf, sizeof(buf));
+    if (n > 0) data += String((const char *)buf, n);
+  }
+  f.close();
+
+  String idKey = String("\"id\":\"") + empId + "\"";
+  int idPos = data.indexOf(idKey);
+  if (idPos < 0) return false;
+  int nextId = data.indexOf("\"id\":\"", idPos + idKey.length());
+  int flagPos = data.indexOf("\"finger_terdaftar\":", idPos);
+  if (flagPos < 0) return false;
+  if (nextId >= 0 && flagPos > nextId) return false;
+
+  int valStart = flagPos + 19;  // length of "finger_terdaftar":
+  while (valStart < (int)data.length() && (data.charAt(valStart) == ' ' || data.charAt(valStart) == '\t'))
+    valStart++;
+  int valEnd = valStart;
+  if (data.substring(valStart, valStart + 4) == "true") valEnd = valStart + 4;
+  else if (data.substring(valStart, valStart + 5) == "false") valEnd = valStart + 5;
+  else return false;
+
+  const char *newVal = registered ? "true" : "false";
+  if (data.substring(valStart, valEnd) == newVal) return true;  // sudah sesuai
+
+  String out = data.substring(0, valStart) + newVal + data.substring(valEnd);
+  String tmp = path + ".tmp";
+  File w = LittleFS.open(tmp, "w");
+  if (!w) return false;
+  w.print(out);
+  w.close();
+  LittleFS.remove(path);
+  if (!LittleFS.rename(tmp, path)) {
+    File a = LittleFS.open(tmp, "r");
+    File b = LittleFS.open(path, "w");
+    if (a && b) {
+      while (a.available()) {
+        int n = a.read(buf, sizeof(buf));
+        if (n > 0) b.write(buf, n);
+      }
+    }
+    if (a) a.close();
+    if (b) b.close();
+    LittleFS.remove(tmp);
+  }
+  return LittleFS.exists(path);
+}
+
+void cacheSetEmployeeRegistered(const char *empId, bool registered) {
+  if (!empId || !empId[0] || !storageReady) return;
+
+  // Coba file cabang dari prefix ID (CKS-HK-0001 → CKS)
+  String kode;
+  for (const char *p = empId; *p && *p != '-'; p++) kode += *p;
+  if (kode.length()) {
+    String path = cacheEmpPath(kode);
+    if (cachePatchEmpFlagInFile(path, empId, registered)) {
+      Serial.printf("[CACHE] %s finger_terdaftar=%s (%s)\n",
+                    empId, registered ? "true" : "false", path.c_str());
+      cacheInvalidateEmpSlim(kode);
+      cacheBuildEmpSlim(kode);
+      return;
+    }
+  }
+
+  // Fallback: scan semua emp_*.json
+  File root = LittleFS.open(CACHE_DIR);
+  if (!root || !root.isDirectory()) return;
+  File file = root.openNextFile();
+  while (file) {
+    String name = String(file.name());
+    file.close();
+    String base = name;
+    int slash = base.lastIndexOf('/');
+    if (slash >= 0) base = base.substring(slash + 1);
+    if (base.startsWith("emp_") && base.endsWith(".json") &&
+        base.indexOf(".tmp") < 0 && base.indexOf(".slim.") < 0) {
+      String path = String(CACHE_DIR) + "/" + base;
+      if (cachePatchEmpFlagInFile(path, empId, registered)) {
+        Serial.printf("[CACHE] %s finger_terdaftar=%s (%s)\n",
+                      empId, registered ? "true" : "false", path.c_str());
+        String k = base.substring(4);
+        if (k.endsWith(".json")) k.remove(k.length() - 5);
+        cacheInvalidateEmpSlim(k);
+        cacheBuildEmpSlim(k);
+        break;
+      }
+    }
+    file = root.openNextFile();
+  }
+}
+
+void cacheInvalidateAllEmployees() {
+  if (!storageReady || !LittleFS.exists(CACHE_DIR)) return;
+  File root = LittleFS.open(CACHE_DIR);
+  if (!root || !root.isDirectory()) return;
+  File file = root.openNextFile();
+  while (file) {
+    String name = String(file.name());
+    file.close();
+    String base = name;
+    int slash = base.lastIndexOf('/');
+    if (slash >= 0) base = base.substring(slash + 1);
+    if (base.startsWith("emp_") && base.endsWith(".json")) {
+      String path = String(CACHE_DIR) + "/" + base;
+      LittleFS.remove(path);
+      Serial.printf("[CACHE] invalidate %s\n", path.c_str());
+    }
+    file = root.openNextFile();
+  }
+}
+
 String apiProxyGet(const char *path, int &httpCode) {
   httpCode = -1;
   if (!appSettings.apiBaseUrl[0]) return "";
   if (WiFi.status() != WL_CONNECTED) return "";
+  if (!httpsLock(30000)) {
+    logError("API GET https busy path=%s", path);
+    return "";
+  }
 
   String url = String(appSettings.apiBaseUrl) + path;
   Serial.print("[API] GET "); Serial.println(url);
   Serial.print("[API] Free heap: "); Serial.println(ESP.getFreeHeap());
 
-  bool isHttps = url.startsWith("https://");
-
-  // Static/reused client — hindari use-after-free async TX (lihat
-  // catatan detail di postAttendance()).
-  static WiFiClientSecure getSecureClient;
-  static WiFiClient getPlainClient;
-  static bool getSecureInit = false;
-  WiFiClient *client;
-  if (isHttps) {
-    if (!getSecureInit) { getSecureClient.setInsecure(); getSecureInit = true; }
-    client = &getSecureClient;
-  } else {
-    client = &getPlainClient;
-  }
-
+  WiFiClient *client = nullptr;
   HTTPClient http;
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(10000);
-  if (!http.begin(*client, url)) {
+  if (!apiHttpBegin(http, client, url, 30000)) {
     Serial.println("[API] begin() failed");
     logError("API GET begin failed path=%s", path);
+    httpsUnlock();
     return "";
   }
   if (appSettings.apiKey[0]) http.addHeader("X-Device-Key", appSettings.apiKey);
   httpCode = http.GET();
   Serial.print("[API] HTTP code: "); Serial.println(httpCode);
-  if (httpCode < 200 || httpCode >= 300) logError("API GET status=%d path=%s", httpCode, path);
+  if (httpCode < 200 || httpCode >= 300) {
+    if (httpCode <= 0) apiHttpLogError("API-GET", http, httpCode);
+    else logError("API GET status=%d path=%s", httpCode, path);
+  }
   String resp = "";
   if (httpCode > 0) {
-    resp = http.getString();
+    resp = apiReadBody(http);
     Serial.print("[API] Response len: "); Serial.println(resp.length());
   }
   http.end();
+  httpsUnlock();
   return resp;
 }
 
@@ -2104,74 +4469,290 @@ String apiProxyPost(const char *path, const String &body, int &httpCode) {
   httpCode = -1;
   if (!appSettings.apiBaseUrl[0]) return "";
   if (WiFi.status() != WL_CONNECTED) return "";
+  if (!httpsLock(20000)) {
+    logError("API POST https busy path=%s", path);
+    return "";
+  }
 
   String url = String(appSettings.apiBaseUrl) + path;
   Serial.print("[API] POST "); Serial.println(url);
 
-  bool isHttps = url.startsWith("https://");
-  // Static/reused client — hindari use-after-free async TX (lihat
-  // catatan detail di postAttendance()).
-  static WiFiClientSecure postSecureClient;
-  static WiFiClient postPlainClient;
-  static bool postSecureInit = false;
-  WiFiClient *client;
-  if (isHttps) {
-    if (!postSecureInit) { postSecureClient.setInsecure(); postSecureInit = true; }
-    client = &postSecureClient;
-  } else {
-    client = &postPlainClient;
-  }
-
+  WiFiClient *client = nullptr;
   HTTPClient http;
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(20000);
-  if (!http.begin(*client, url)) {
-    logError("API POST begin failed path=%s", path);
+  if (!apiHttpBegin(http, client, url, 20000)) {
+    httpsUnlock();
     return "";
   }
   http.addHeader("Content-Type", "application/json");
   if (appSettings.apiKey[0]) http.addHeader("X-Device-Key", appSettings.apiKey);
   httpCode = http.POST(body);
-  if (httpCode < 200 || httpCode >= 300) logError("API POST status=%d path=%s", httpCode, path);
+  if (httpCode < 200 || httpCode >= 300) {
+    if (httpCode <= 0) apiHttpLogError("API-POST", http, httpCode);
+    else logError("API POST status=%d path=%s", httpCode, path);
+  }
   String resp = "";
-  if (httpCode > 0) resp = http.getString();
+  if (httpCode > 0) resp = apiReadBody(http);
   http.end();
+  httpsUnlock();
   return resp;
 }
 
 void handleBranches() {
   if (!requireAuth()) return;
+  if (server.method() == HTTP_OPTIONS) { server.send(200); return; }
+  bool refresh = server.hasArg("refresh") && server.arg("refresh") == "1";
+  bool haveCache = storageReady && LittleFS.exists(CACHE_BRANCHES);
+
+  // Default: sajikan cache lokal (cepat, tanpa hit API).
+  if (!refresh && haveCache) {
+    if (sendLittleFSFile(CACHE_BRANCHES, "HIT")) return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED || !appSettings.apiBaseUrl[0]) {
+    if (haveCache && sendLittleFSFile(CACHE_BRANCHES, "STALE")) return;
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(502, "application/json",
+                "{\"ok\":false,\"error\":\"" +
+                String(!appSettings.apiBaseUrl[0] ? "apiBaseUrl_empty" : "wifi_not_connected") +
+                "\"}");
+    return;
+  }
+
+  // Jangan block HTTP thread — unduh di cacheHttp worker.
+  if (refresh || !haveCache) {
+    cacheBranchesWanted = true;
+  }
+
+  if (haveCache) {
+    if (sendLittleFSFile(CACHE_BRANCHES, refresh ? "REFRESHING" : "BUSY")) return;
+  }
+
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  if (WiFi.status() != WL_CONNECTED) {
-    server.send(502, "application/json", "{\"ok\":false,\"error\":\"wifi_not_connected\"}");
-    return;
-  }
-  int httpCode = 0;
-  String resp = apiProxyGet("/api/finger/branches", httpCode);
-  if (resp.length() == 0) {
-    server.send(502, "application/json", "{\"ok\":false,\"error\":\"backend_unreachable\",\"httpCode\":" + String(httpCode) + ",\"heap\":" + String(ESP.getFreeHeap()) + "}");
-    return;
-  }
-  server.send(200, "application/json", resp);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json",
+              "{\"ok\":false,\"error\":\"caching\",\"retry\":true}");
 }
 
 void handleEmployees() {
   if (!requireAuth()) return;
+  if (server.method() == HTTP_OPTIONS) { server.send(200); return; }
   server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "no-store");
+
+  String kode = server.arg("kode_cabang");
+  bool refresh = server.hasArg("refresh") && server.arg("refresh") == "1";
+  bool select2 = server.hasArg("select2") && server.arg("select2") == "1";
+  String q = server.hasArg("q") ? server.arg("q") : "";
+  int page = server.hasArg("page") ? server.arg("page").toInt() : 1;
+  int limit = server.hasArg("limit") ? server.arg("limit").toInt() : 30;
+  if (page < 1) page = 1;
+  if (limit < 1) limit = 30;
+  if (limit > 50) limit = 50;
+
+  // "Semua cabang" tidak di-cache (payload besar) — stream langsung bila online.
+  if (!kode.length() || kode == "__all__") {
+    if (select2) {
+      server.send(422, "application/json",
+                  "{\"ok\":false,\"error\":\"pilih_cabang\",\"results\":[],\"more\":false}");
+      return;
+    }
+    if (WiFi.status() != WL_CONNECTED || !appSettings.apiBaseUrl[0]) {
+      server.send(502, "application/json", "{\"ok\":false,\"error\":\"wifi_or_api_required_for_all\"}");
+      return;
+    }
+    if (!httpsLock(45000)) {
+      server.send(503, "application/json", "{\"ok\":false,\"error\":\"https_busy\",\"retry\":true}");
+      return;
+    }
+    String url = String(appSettings.apiBaseUrl) + "/api/finger/employees";
+    if (kode.length() && kode != "__all__") url += "?kode_cabang=" + kode;
+    WiFiClient *client = nullptr;
+    HTTPClient http;
+    if (!apiHttpBegin(http, client, url, 45000)) {
+      httpsUnlock();
+      server.send(502, "application/json", "{\"ok\":false,\"error\":\"backend_unreachable\"}");
+      return;
+    }
+    if (appSettings.apiKey[0]) http.addHeader("X-Device-Key", appSettings.apiKey);
+    int httpCode = http.GET();
+    if (httpCode < 200 || httpCode >= 300) {
+      http.end();
+      httpsUnlock();
+      server.send(502, "application/json", "{\"ok\":false,\"error\":\"backend_unreachable\",\"httpCode\":" + String(httpCode) + "}");
+      return;
+    }
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.sendHeader("X-Cache", "BYPASS");
+    server.send(200, "application/json", "");
+    WebForwardStream fwd;
+    http.writeToStream(&fwd);
+    server.sendContent("");
+    http.end();
+    httpsUnlock();
+    return;
+  }
+
+  String cpath = cacheEmpPath(kode);
+  String spath = cacheEmpSlimPath(kode);
+  bool haveCache = storageReady && LittleFS.exists(cpath);
+  bool haveSlim = storageReady && LittleFS.exists(spath);
+  bool jobThis = cacheEmpJobWanted && String(cacheEmpJobKode) == kode;
+
+  // Select2 async: LIVE ke server PJTKI (page kecil). Cache lokal hanya fallback offline.
+  if (select2) {
+    if (wifiScanPhase == 1) {
+      server.send(200, "application/json",
+                  "{\"ok\":false,\"error\":\"wifi_scanning\",\"retry\":true,\"results\":[],\"more\":false}");
+      return;
+    }
+    if (WiFi.status() == WL_CONNECTED && appSettings.apiBaseUrl[0]) {
+      if (proxyEmployeesSelect2Live(kode, q, page, limit)) return;
+      // Live gagal → coba cache lokal bila ada
+      if (sendEmployeesSelect2(kode, q, page, limit)) return;
+      server.send(502, "application/json",
+                  "{\"ok\":false,\"error\":\"backend_unreachable\",\"results\":[],\"more\":false}");
+      return;
+    }
+    // Offline: cache LittleFS
+    if (sendEmployeesSelect2(kode, q, page, limit)) return;
+    server.send(502, "application/json",
+                "{\"ok\":false,\"error\":\"wifi_or_cache_missing\",\"results\":[],\"more\":false}");
+    return;
+  }
+
+  // Serve cepat: slim dulu (Malang jauh lebih kecil), lalu full cache.
+  if (!refresh) {
+    if (wifiScanPhase == 1) {
+      server.send(200, "application/json",
+                  "{\"ok\":false,\"error\":\"wifi_scanning\",\"retry\":true}");
+      return;
+    }
+    if (haveSlim && sendLittleFSFile(spath.c_str(), "HIT-SLIM")) return;
+    if (haveCache && sendLittleFSFile(cpath.c_str(), "HIT")) return;
+  }
+
+  // Offline: pakai cache apa adanya
+  if (WiFi.status() != WL_CONNECTED || !appSettings.apiBaseUrl[0]) {
+    if (haveSlim && sendLittleFSFile(spath.c_str(), "STALE-SLIM")) return;
+    if (haveCache && sendLittleFSFile(cpath.c_str(), "STALE")) return;
+    server.send(502, "application/json",
+                "{\"ok\":false,\"error\":\"" +
+                String(!appSettings.apiBaseUrl[0] ? "apiBaseUrl_empty" : "wifi_not_connected") +
+                "\"}");
+    return;
+  }
+
+  // Jangan block HTTP 30–45 detik saat unduh Malang — async + UI poll.
+  if (cacheEmpJobFail && String(cacheEmpJobKode) == kode && !cacheEmpJobWanted && !haveCache) {
+    cacheEmpJobFail = false;
+    server.send(502, "application/json", "{\"ok\":false,\"error\":\"backend_unreachable\"}");
+    return;
+  }
+
+  if (refresh || !haveCache) {
+    if (!jobThis && !(cacheSyncBusy && String(cacheEmpJobKode) == kode)) {
+      cacheRequestEmployees(kode);
+    }
+    // Saat refresh, tetap sajikan cache lama jika ada (UI tidak kosong).
+    if (refresh) {
+      if (haveSlim && sendLittleFSFile(spath.c_str(), "REFRESHING-SLIM")) return;
+      if (haveCache && sendLittleFSFile(cpath.c_str(), "REFRESHING")) return;
+    }
+    server.send(200, "application/json",
+                "{\"ok\":false,\"error\":\"caching\",\"retry\":true,\"kode_cabang\":\"" + kode + "\"}");
+    return;
+  }
+
+  server.send(502, "application/json", "{\"ok\":false,\"error\":\"backend_unreachable\"}");
+}
+
+void handleCacheStatus() {
+  if (!requireAuth()) return;
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["storageReady"] = storageReady;
+  doc["syncBusy"] = cacheSyncBusy;
+  doc["refreshMinutes"] = (int)(CACHE_REFRESH_MS / 60000UL);
+  unsigned long now = cacheEpochNow();
+  unsigned long bts = cacheMetaGet("branches");
+  doc["branchesCached"] = storageReady && LittleFS.exists(CACHE_BRANCHES);
+  doc["branchesAgeSec"] = (bts && now >= bts) ? (now - bts) : -1;
+  if (storageReady && LittleFS.exists(CACHE_BRANCHES)) {
+    File f = LittleFS.open(CACHE_BRANCHES, "r");
+    doc["branchesBytes"] = f ? (int)f.size() : 0;
+    if (f) f.close();
+  }
+  String kode = server.hasArg("kode_cabang") ? server.arg("kode_cabang") : String(appSettings.kodeCabang);
+  if (kode.length() && kode != "__all__") {
+    String p = cacheEmpPath(kode);
+    String mk = "emp_" + kode;
+    unsigned long ets = cacheMetaGet(mk.c_str());
+    doc["kode_cabang"] = kode;
+    doc["employeesCached"] = LittleFS.exists(p);
+    doc["employeesAgeSec"] = (ets && now >= ets) ? (now - ets) : -1;
+    if (LittleFS.exists(p)) {
+      File f = LittleFS.open(p, "r");
+      doc["employeesBytes"] = f ? (int)f.size() : 0;
+      if (f) f.close();
+    }
+  }
+  String json;
+  serializeJson(doc, json);
+  server.send(200, "application/json", json);
+}
+
+void handleCacheRefresh() {
+  if (!requireAuth()) return;
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (server.method() == HTTP_OPTIONS) { server.send(200); return; }
   if (WiFi.status() != WL_CONNECTED) {
     server.send(502, "application/json", "{\"ok\":false,\"error\":\"wifi_not_connected\"}");
     return;
   }
-  String kode = server.arg("kode_cabang");
-  String path = "/api/finger/employees";
-  if (kode.length() > 0) path += "?kode_cabang=" + kode;
-  int httpCode = 0;
-  String resp = apiProxyGet(path.c_str(), httpCode);
-  if (resp.length() == 0) {
-    server.send(502, "application/json", "{\"ok\":false,\"error\":\"backend_unreachable\",\"httpCode\":" + String(httpCode) + ",\"heap\":" + String(ESP.getFreeHeap()) + "}");
+  if (!appSettings.apiBaseUrl[0]) {
+    server.send(502, "application/json", "{\"ok\":false,\"error\":\"apiBaseUrl_empty\"}");
     return;
   }
-  server.send(200, "application/json", resp);
+  if (cacheSyncBusy || enrollActive || restoreActive) {
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"busy\"}");
+    return;
+  }
+
+  String kode = "";
+  if (server.hasArg("plain") && server.arg("plain").length()) {
+    JsonDocument body;
+    if (!deserializeJson(body, server.arg("plain"))) {
+      kode = String((const char *)(body["kode_cabang"] | ""));
+    }
+  }
+  if (!kode.length() && server.hasArg("kode_cabang")) kode = server.arg("kode_cabang");
+  if (!kode.length() && appSettings.kodeCabang[0]) kode = String(appSettings.kodeCabang);
+
+  cacheBranchesWanted = true;
+  if (kode.length() && kode != "__all__") cacheRequestEmployees(kode);
+  else if (appSettings.kodeCabang[0]) cacheRequestEmployees(String(appSettings.kodeCabang));
+
+  // Tunggu worker selesai sambil tetap layani AP/web (jangan block radio).
+  unsigned long t0 = millis();
+  while ((cacheBranchesWanted || cacheEmpJobWanted || cacheSyncBusy) &&
+         (millis() - t0 < 90000UL)) {
+    wifiServicePump();
+    delay(40);
+  }
+  bool okB = storageReady && LittleFS.exists(CACHE_BRANCHES);
+  bool okE = false;
+  if (kode.length() && kode != "__all__") okE = LittleFS.exists(cacheEmpPath(kode));
+  lastCacheSyncMs = millis();
+
+  String json = "{\"ok\":true,\"branches\":";
+  json += okB ? "true" : "false";
+  json += ",\"employees\":";
+  json += okE ? "true" : "false";
+  json += ",\"kode_cabang\":\"";
+  json += kode;
+  json += "\"}";
+  server.send(200, "application/json", json);
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -2218,11 +4799,10 @@ bool sendFingerCmd(const uint8_t *payload, uint8_t payloadLen, uint8_t *outType,
   return false;
 }
 
-// Read 256-byte template from sensor for given ID
-// Read 256-byte template from sensor for given ID (sent as two 128-byte DATA packets)
+// Read 256-byte template from sensor for given ID (DATA 0x02 + END 0x08 packets)
 bool getTemplateRaw(uint16_t id, uint8_t *buf) {
   if (finger.loadModel(id) != FINGERPRINT_OK) return false;
-  delay(30);
+  delay(50);
   flushRX();
 
   uint8_t upHdr[] = {0xEF,0x01,0xFF,0xFF,0xFF,0xFF,0x01,0x00,0x04};
@@ -2236,76 +4816,78 @@ bool getTemplateRaw(uint16_t id, uint8_t *buf) {
   altSerial.flush();
 
   unsigned long start = millis();
-  uint8_t pkt[500];
+  unsigned long lastByte = 0;
+  uint8_t pkt[700];
   uint16_t idx = 0;
-  while (millis()-start < 3000 && idx < sizeof(pkt)) {
+  while (millis() - start < 2500 && idx < sizeof(pkt)) {
     if (altSerial.available()) {
       pkt[idx++] = altSerial.read();
+      lastByte = millis();
+    } else if (lastByte && millis() - lastByte > 100) {
+      break;
+    } else {
+      delay(1);
     }
-    delay(1);
   }
   if (idx < 9) return false;
 
-  // Scan for DATA packets (type 0x02, wire_len=130 = 128 data + 2 chk)
-  uint8_t chunks[2][128];
-  uint8_t chunkCount = 0;
-  for (uint16_t i = 0; i <= idx - 9 && chunkCount < 2; i++) {
-    if (pkt[i]==0xEF && pkt[i+1]==0x01 && pkt[i+6]==0x02) {
-      uint16_t wLen = ((uint16_t)pkt[i+7] << 8) | pkt[i+8];
-      if (wLen >= 130 && i + 9 + 128 <= idx) {
-        memcpy(chunks[chunkCount], pkt + i + 9, 128);
-        chunkCount++;
-      }
+  memset(buf, 0, 256);
+  uint16_t copied = 0;
+  uint16_t i = 0;
+  while (i + 9 <= idx && copied < 256) {
+    if (!(pkt[i] == 0xEF && pkt[i + 1] == 0x01)) { i++; continue; }
+    uint8_t ptype = pkt[i + 6];
+    uint16_t wLen = ((uint16_t)pkt[i + 7] << 8) | pkt[i + 8];
+    uint16_t total = 9 + wLen;
+    if (wLen < 2 || i + total > idx) break;
+    uint16_t dataLen = wLen - 2;
+    if ((ptype == 0x02 || ptype == 0x08) && dataLen >= 128) {
+      uint16_t n = dataLen;
+      if (n > 256 - copied) n = 256 - copied;
+      memcpy(buf + copied, pkt + i + 9, n);
+      copied += n;
     }
+    i += total;
   }
-
-  if (chunkCount == 0) return false;
-  memcpy(buf, chunks[0], 128);
-  if (chunkCount >= 2) memcpy(buf + 128, chunks[1], 128);
-  else memset(buf + 128, 0, 128);
-  return true;
+  return copied >= 128;
 }
 
-// Write 256-byte template to sensor (two 128-byte DownChar calls, then storeModel)
+// Write 256-byte template: DownChar buffer 1, lalu 2 paket DATA 128-byte, lalu storeModel
 bool putTemplateRaw(uint16_t id, const uint8_t *buf) {
-  // 1. DownChar buffer 1 with first 128 bytes
-  for (uint8_t buffer = 1; buffer <= 2; buffer++) {
-    flushRX();
-    uint8_t hdr[] = {0xEF,0x01,0xFF,0xFF,0xFF,0xFF,0x01,0x00,0x00};
-    uint16_t wLen = 2 + 128 + 2; // cmd + param + data(128) + chk(2)
-    hdr[7] = wLen >> 8; hdr[8] = wLen & 0xFF;
-    uint16_t sum = 0;
-    for (int i = 6; i < 9; i++) sum += hdr[i];
-    sum += 0x09 + buffer;
-    const uint8_t *chunk = buf + (buffer - 1) * 128;
-    for (int i = 0; i < 128; i++) sum += chunk[i];
+  flushRX();
+  delay(40);
+  uint8_t payload[2] = {0x09, 0x01};
+  uint8_t ackType = 0, ackBuf[16];
+  uint16_t ackLen = 0;
+  if (!sendFingerCmd(payload, 2, &ackType, ackBuf, &ackLen)) {
+    logError("putTemplate DownChar cmd fail id=%d", id);
+    return false;
+  }
+  if (ackType != 0x07 || ackBuf[0] != 0x00) {
+    logError("putTemplate DownChar ack type=%d code=%d id=%d", ackType, ackBuf[0], id);
+    return false;
+  }
 
+  for (uint8_t n = 0; n < 2; n++) {
+    uint8_t ptype = (n == 1) ? 0x08 : 0x02;
+    const uint8_t *chunk = buf + n * 128;
+    uint8_t hdr[9] = {0xEF, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, ptype, 0x00, 0x82};
+    uint16_t sum = ptype + 0x00 + 0x82;
+    for (int i = 0; i < 128; i++) sum += chunk[i];
     altSerial.write(hdr, 9);
-    altSerial.write((uint8_t)0x09);
-    altSerial.write(buffer);
     altSerial.write(chunk, 128);
     altSerial.write((uint8_t)(sum >> 8));
     altSerial.write((uint8_t)(sum & 0xFF));
     altSerial.flush();
-
-    // Read ACK
-    uint8_t resp[12];
-    uint16_t ri = 0;
-    unsigned long start = millis();
-    while (ri < 11 && millis() - start < 2000) {
-      if (altSerial.available()) {
-        uint8_t b = altSerial.read();
-        if (ri == 0 && b != 0xEF) continue;
-        resp[ri++] = b;
-      }
-      delay(1);
-    }
-    if (ri < 11 || resp[9] != 0x00) return false;
-    delay(20);
+    delay(30);
   }
-
-  // 2. Store buffer 1+2 to flash using library
-  return finger.storeModel(id) == FINGERPRINT_OK;
+  delay(80);
+  uint8_t st = finger.storeModel(id);
+  if (st != FINGERPRINT_OK) {
+    logError("putTemplate storeModel id=%d code=%d", id, st);
+    return false;
+  }
+  return true;
 }
 
 String toHex(const uint8_t *buf, size_t len) {
@@ -2318,9 +4900,13 @@ String toHex(const uint8_t *buf, size_t len) {
 }
 
 bool fromHex(const char *hex, uint8_t *buf, size_t maxLen) {
+  if (!hex || !buf || !maxLen) return false;
   size_t hexLen = strlen(hex);
-  if (hexLen % 2 != 0 || hexLen / 2 > maxLen) return false;
-  for (size_t i = 0; i < hexLen / 2; i++) {
+  if (hexLen < 256 || (hexLen % 2) != 0) return false;
+  size_t n = hexLen / 2;
+  if (n > maxLen) n = maxLen;
+  memset(buf, 0, maxLen);
+  for (size_t i = 0; i < n; i++) {
     char hi = hex[i * 2];
     char lo = hex[i * 2 + 1];
     buf[i] = ((hi >= 'a' ? hi - 'a' + 10 : hi >= 'A' ? hi - 'A' + 10 : hi - '0') << 4) |
@@ -2332,20 +4918,6 @@ bool fromHex(const char *hex, uint8_t *buf, size_t maxLen) {
 // ────────────────────────────────────────────────────────────────────
 //  Backup (metadata only)
 // ────────────────────────────────────────────────────────────────────
-String jsonEscape(const char *s) {
-  String r;
-  for (size_t i = 0; s[i]; i++) {
-    char c = s[i];
-    if (c == '"') r += "\\\"";
-    else if (c == '\\') r += "\\\\";
-    else if (c == '\n') r += "\\n";
-    else if (c == '\r') r += "\\r";
-    else if (c == '\t') r += "\\t";
-    else if (c >= 0x20) r += c;
-  }
-  return r;
-}
-
 void handleBackup() {
   if (!requireAuth()) return;
   if (enrollActive || restoreActive) { server.send(503, "application/json", "{\"ok\":false,\"error\":\"busy\"}"); return; }
@@ -2364,8 +4936,8 @@ void handleBackup() {
   for (int i = 0; i < fpCount; i++) {
     if (i > 0) json += ",";
     json += "\"" + String(fpDB[i].id) + "\":{";
-    json += "\"name\":\"" + jsonEscape(fpDB[i].name) + "\"";
-    if (fpDB[i].empId[0]) json += ",\"employeeId\":\"" + jsonEscape(fpDB[i].empId) + "\"";
+    json += "\"name\":\"" + String(jsonEscape(fpDB[i].name)) + "\"";
+    if (fpDB[i].empId[0]) json += ",\"employeeId\":\"" + String(jsonEscape(fpDB[i].empId)) + "\"";
     json += "}";
   }
   json += "}}";
@@ -2424,8 +4996,8 @@ void handleRestore() {
     first = false;
     detail += "{\"id\":" + String(id);
     detail += ",\"template\":" + String(templateExists ? "true" : "false");
-    detail += ",\"name\":\"" + jsonEscape(name) + "\"";
-    if (empId[0]) detail += ",\"employeeId\":\"" + jsonEscape(empId) + "\"";
+    detail += ",\"name\":\"" + String(jsonEscape(name)) + "\"";
+    if (empId[0]) detail += ",\"employeeId\":\"" + String(jsonEscape(empId)) + "\"";
     detail += "}";
 
     if (templateExists) restored++;
@@ -2475,8 +5047,8 @@ void handleBackupFull() {
   for (int i = 0; i < fpCount; i++) {
     if (i > 0) s += ",";
     s += "\"" + String(fpDB[i].id) + "\":{";
-    s += "\"name\":\"" + jsonEscape(fpDB[i].name) + "\"";
-    if (fpDB[i].empId[0]) s += ",\"employeeId\":\"" + jsonEscape(fpDB[i].empId) + "\"";
+    s += "\"name\":\"" + String(jsonEscape(fpDB[i].name)) + "\"";
+    if (fpDB[i].empId[0]) s += ",\"employeeId\":\"" + String(jsonEscape(fpDB[i].empId)) + "\"";
     s += "}";
   }
   s += "}";
@@ -2574,7 +5146,19 @@ uint8_t nextFreeFingerId() {
     for (int i = 0; i < fpCount; i++) {
       if (fpDB[i].id == id) { used = true; break; }
     }
-    if (!used) return id;
+    if (used) continue;
+    // Cek slot fisik di sensor juga — fpDB bisa tidak sinkron (mis. sensor
+    // di-restore lewat Cadangan). loadModel() return FINGERPRINT_OK jika
+    // template sudah ada di slot tsb.
+    if (sensorReady) {
+      uint8_t p = finger.loadModel(id);
+      if (p == FINGERPRINT_OK) continue;
+      if (p == FINGERPRINT_BADLOCATION) return id;
+      // PACKETRECIEVEERR/lain: komunikasi gagal — abaikan cek sensor
+      // supaya enroll tetap bisa jalan (ID bisa dicek lagi oleh sensor saat
+      // fingerSearch di enrollFinger).
+    }
+    return id;
   }
   return 0;
 }
@@ -2630,9 +5214,19 @@ void handleSyncFromServer() {
     const char *empId = v.as<const char*>();
     if (!empId || !empId[0]) continue;
 
-    if (findDbByEmpId(empId) >= 0) {
+    int dbIdx = findDbByEmpId(empId);
+    bool onSensor = false;
+    if (dbIdx >= 0) {
+      // fpDB ada entry, tapi pastikan template beneran ada di sensor.
+      // Kalau sensor pernah di-reset/empty tanpa update fpDB, entry tsb
+      // harus direstore, bukan di-skip.
+      flushRX();
+      delay(10);
+      onSensor = (finger.loadModel(fpDB[dbIdx].id) == FINGERPRINT_OK);
+    }
+    if (dbIdx >= 0 && onSensor) {
       skipped++;
-      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"skipped_local\"}"), empId);
+      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"skipped_local\"}"), jsonEscape(empId));
       continue;
     }
 
@@ -2640,28 +5234,33 @@ void handleSyncFromServer() {
     int code2 = 0;
     String oneResp = apiProxyGet(onePath.c_str(), code2);
     if (oneResp.length() == 0 || code2 < 200 || code2 >= 300) {
+      logError("sync fetch fail emp=%s http=%d len=%u", empId, code2, (unsigned)oneResp.length());
       if (code2 == 422) noHex++;
       else failed++;
-      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"fetch_fail\"}"), empId);
+      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"fetch_fail\"}"), jsonEscape(empId));
       continue;
     }
 
-    DynamicJsonDocument oneDoc(3072);
-    if (deserializeJson(oneDoc, oneResp) || !oneDoc["success"]) {
-      if (code2 == 422) noHex++;
-      else failed++;
-      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"no_hex\"}"), empId);
+    JsonDocument oneDoc;
+    DeserializationError perr = deserializeJson(oneDoc, oneResp);
+    if (perr || !oneDoc["success"]) {
+      logError("sync json fail emp=%s err=%s len=%u", empId, perr.c_str(), (unsigned)oneResp.length());
+      failed++;
+      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"no_hex\"}"), jsonEscape(empId));
       continue;
     }
 
-    const char *hex = oneDoc["data"]["template_hex"] | "";
-    const char *nm = oneDoc["data"]["nama"] | "";
+    String hexStr = oneDoc["data"]["template_hex"] | "";
+    String nmStr = oneDoc["data"]["nama"] | "";
     int preferId = oneDoc["data"]["finger_id"] | 0;
+    const char *hex = hexStr.c_str();
+    const char *nm = nmStr.c_str();
 
     uint8_t tpl[256];
     if (!hex[0] || !fromHex(hex, tpl, 256)) {
+      logError("sync bad_hex emp=%s hex_len=%u", empId, (unsigned)hexStr.length());
       failed++;
-      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"bad_hex\"}"), empId);
+      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"bad_hex\"}"), jsonEscape(empId));
       continue;
     }
 
@@ -2674,7 +5273,7 @@ void handleSyncFromServer() {
     if (!id) id = nextFreeFingerId();
     if (!id) {
       failed++;
-      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"no_slot\"}"), empId);
+      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"no_slot\"}"), jsonEscape(empId));
       break;
     }
 
@@ -2693,17 +5292,18 @@ void handleSyncFromServer() {
         if (finger.loadModel(cand) != FINGERPRINT_OK) { found = cand; break; }
       }
       id = found;
-      if (!id) { failed++; emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"no_slot\"}"), empId); break; }
+      if (!id) { failed++; emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"no_slot\"}"), jsonEscape(empId)); break; }
     }
 
     bool ok = putTemplateRaw(id, tpl);
     if (ok) {
       dbAdd(id, nm && nm[0] ? nm : empId, empId);
       restored++;
-      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"id\":%d,\"status\":\"restored\"}"), empId, id);
+      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"id\":%d,\"status\":\"restored\"}"), jsonEscape(empId), id);
     } else {
+      logError("sync write_fail emp=%s slot=%d", empId, id);
       failed++;
-      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"write_fail\"}"), empId);
+      emit(F("{\"event\":\"sync_progress\",\"employeeId\":\"%s\",\"status\":\"write_fail\"}"), jsonEscape(empId));
     }
     delay(50);
     yield();
@@ -2784,8 +5384,33 @@ void handleStorage() {
   server.send(200, "application/json", json);
 }
 
+void handleCaptiveProbe() {
+  // Probe OS (Android/iOS/Windows) → redirect ke portal UI, bukan 404 JSON.
+  server.sendHeader("Location", "http://192.168.4.1/", true);
+  server.sendHeader("Cache-Control", "no-cache");
+  server.send(302, "text/plain", "");
+}
+
 void handleNotFound() {
   if (server.method() == HTTP_OPTIONS) { server.send(200); return; }
+
+  String uri = server.uri();
+  Serial.printf("[HTTP] notfound %s\n", uri.c_str());
+
+  // Unknown API → JSON
+  if (uri.startsWith("/api/")) {
+    server.send(404, "application/json", "{\"error\":\"not_found\"}");
+    return;
+  }
+
+  // Mode AP / captive portal: HP sering buka path acak → jangan blank 404.
+  if (wifiApSetupMode || !wifiConnected) {
+    if (server.method() == HTTP_GET) {
+      handleCaptiveProbe();
+      return;
+    }
+  }
+
   server.send(404, "application/json", "{\"error\":\"not_found\"}");
 }
 
@@ -2820,10 +5445,10 @@ void handleCredSave() {
     return;
   }
 
-  if (doc.containsKey("webUser")) strncpy(cred.webUser, doc["webUser"] | "", 31);
-  if (doc.containsKey("webPass") && strlen(doc["webPass"] | "") > 0) strncpy(cred.webPass, doc["webPass"] | "", 63);
-  if (doc.containsKey("apPass") && strlen(doc["apPass"] | "") > 0) strncpy(cred.apPass, doc["apPass"] | "", 64);
-  if (doc.containsKey("ntpServer")) strncpy(cred.ntpServer, doc["ntpServer"] | "", 63);
+  if (doc.containsKey("webUser")) { strncpy(cred.webUser, doc["webUser"] | "", 31); cred.webUser[31] = 0; }
+  if (doc.containsKey("webPass") && strlen(doc["webPass"] | "") > 0) { strncpy(cred.webPass, doc["webPass"] | "", 63); cred.webPass[63] = 0; }
+  if (doc.containsKey("apPass") && strlen(doc["apPass"] | "") > 0) { strncpy(cred.apPass, doc["apPass"] | "", 64); cred.apPass[64] = 0; }
+  if (doc.containsKey("ntpServer")) { strncpy(cred.ntpServer, doc["ntpServer"] | "", 63); cred.ntpServer[63] = 0; }
   if (doc.containsKey("utcOffset")) cred.utcOffset = doc["utcOffset"] | 25200;
   if (!credSave()) {
     server.send(500, "application/json", "{\"ok\":false,\"error\":\"credentials_save_failed\"}");
@@ -3231,78 +5856,83 @@ updStatus();setInterval(updStatus,5000);
 //  AUTO-RECOVERY: re-init sensor & restart auto-scan
 // ────────────────────────────────────────────────────────────────────
 bool reinitSensor() {
-  Serial.println("[SENSOR] Re-init sensor (WiFi OFF)...");
+  Serial.println("[SENSOR] Re-init sensor (WiFi ON, hardware UART)...");
   autoScan = false;
   sensorReady = false;
 
-  // Matikan WiFi
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  delay(100);
-  yield();
+  // JANGAN bleStop()/bleInit() di sini — NimBLE deinit mengganggu coexist
+  // WiFi/AP → HP kehilangan AP saat finger mati. Sensor di UART2, WiFi tetap ON.
 
-  // Tunggu sensor stabil setelah WiFi OFF (serial line clear)
-  delay(3000);
+  // Tunggu sensor stabil — tetap pump web supaya AP hidup
+  pumpDelay(1500);
 
   bool ok = false;
   curBaud = 0;
 
-  // Phase 1: Fokus di 57600 (default FPM10A 3.3V) — coba 8x
-  Serial.println("[SENSOR] Phase1: 57600 x8...");
+  // ⚠️ reinitSensor dipanggil dari loopTask (watchdogCheck / loop reconnect /
+  // post-enroll). Deteksi baud blokir loop berdetik-detik (5×57600 + 4×baud,
+  // tiap verifyPassword + pumpDelay). TANPA disableLoopWDT → task watchdog
+  // triggered → reboot (lihat log: "task_wdt ... loopTask (CPU 1) ... Aborting").
+  // Sama seperti enrollFinger: blocking sensor WAJIB di-wrap WDT.
+  disableLoopWDT();
+
+  // Phase 1: Fokus di 57600 (default FPM10A 3.3V)
+  Serial.println("[SENSOR] Phase1: 57600 x5...");
   altSerial.end();
-  delay(250);
+  pumpDelay(200);
   altSerial.begin(57600, SERIAL_8N1, FINGER_RX, FINGER_TX);
-  delay(400);
+  pumpDelay(300);
   flushRX();
   finger.begin(57600);
-  delay(300);
+  pumpDelay(200);
 
-  for (int attempt = 0; attempt < 8 && !ok; attempt++) {
-    Serial.printf("[SENSOR] 57600 try %d/8\n", attempt + 1);
+  for (int attempt = 0; attempt < 5 && !ok; attempt++) {
+    wifiServicePump();
+    Serial.printf("[SENSOR] 57600 try %d/5\n", attempt + 1);
     if (finger.verifyPassword()) {
       curBaud = 57600;
       ok = true;
     } else {
-      delay(200);
+      pumpDelay(150);
       flushRX();
     }
   }
 
-  // Phase 2: Coba semua baud
+  // Phase 2: Coba semua baud (lebih pendek — jangan blok AP terlalu lama)
   if (!ok) {
-    const unsigned long tryBauds[] = {57600, 9600, 19200, 38400};  // 3.3V: skip 115200
+    const unsigned long tryBauds[] = {57600, 9600, 19200, 38400};
     for (int i = 0; i < 4 && !ok; i++) {
       unsigned long baud = tryBauds[i];
       Serial.printf("[SENSOR] Phase2: Baud %lu...\n", baud);
       altSerial.end();
-      delay(250);
+      pumpDelay(150);
       altSerial.begin(baud, SERIAL_8N1, FINGER_RX, FINGER_TX);
-      delay(400);
+      pumpDelay(250);
       flushRX();
       finger.begin(baud);
-      delay(300);
-      for (int attempt = 0; attempt < 5 && !ok; attempt++) {
+      pumpDelay(150);
+      for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+        wifiServicePump();
         if (finger.verifyPassword()) {
           curBaud = baud;
           ok = true;
         } else {
-          delay(150);
+          pumpDelay(100);
           flushRX();
         }
       }
     }
   }
 
-  // Hidupkan WiFi kembali
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(AP_SSID, cred.apPass);
-  WiFi.setSleep(false);
+  enableLoopWDT();
+  esp_task_wdt_reset();
+
+  wifiEnsureApAlive();
 
   if (ok) {
-    delay(200);
+    pumpDelay(100);
     finger.getParameters();
-    finger.setSecurityLevel(FINGERPRINT_SECURITY_LEVEL_2);  // 3.3V: gambar kurang detail
-    // 3.3V: ESP32 HardwareSerial UART2 stabil, FPM10A bekerja di baud terdeteksi
+    finger.setSecurityLevel(FINGERPRINT_SECURITY_LEVEL_2);
     finger.getTemplateCount();
     sensorReady = true;
     autoScan = true;
@@ -3316,50 +5946,78 @@ bool reinitSensor() {
     emit(F("{\"event\":\"autoscan_on\"}"));
     Serial.printf("[SENSOR] Recovered baud=%lu templates=%d\n", curBaud, finger.templateCount);
   } else {
-    Serial.println("[SENSOR] Re-init FAILED");
+    Serial.println("[SENSOR] Re-init FAILED — AP tetap dilayani");
     logError("sensor reinit failed");
+    sensorReady = false;
+    autoScan = false;
   }
   return ok;
 }
 
-// ── WiFi reconnect (dipanggil setelah reinitSensor) ──
+// ── WiFi reconnect (setelah reinitSensor / drop STA) ──
+// JANGAN paksa semua SSID saat AP setup — itu merusak kestabilan AP.
 void wifiReconnect() {
   if (WiFi.status() == WL_CONNECTED) {
-    wifiApplyPowerPolicy();
-    return;
-  }
-  if (savedWiFiCount == 0) {
-    wifiApplyPowerPolicy();
+    wifiMarkStaConnected(staSSID.c_str());
     return;
   }
 
-  for (int i = 0; i < savedWiFiCount; i++) {
-    Serial.printf("[WiFi] Reconnect to %s...\n", savedWiFi[i].ssid);
-    WiFi.begin(savedWiFi[i].ssid, savedWiFi[i].pass);
-    unsigned long start = millis();
-    while (millis() - start < 8000) {
-      if (WiFi.status() == WL_CONNECTED) break;
-      delay(100);
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      wifiConnected = true;
-      staIP = WiFi.localIP().toString();
-      staSSID = String(savedWiFi[i].ssid);
-      WiFi.softAPdisconnect(true);
-      WiFi.mode(WIFI_STA);
-      wifiApplyPowerPolicy();
-      Serial.printf("[WiFi] Connected to %s | IP: %s | sleep ON\n", staSSID.c_str(), staIP.c_str());
-      return;
-    }
-    WiFi.disconnect();
+  // Mode setup AP: JANGAN wifiEnterApOnly() (softAP ulang = putus client).
+  if (wifiApSetupMode || !wifiStaEverOk || savedWiFiCount == 0) {
+    wifiEnsureApAlive();
+    return;
   }
-  Serial.println("[WiFi] All reconnect attempts failed, AP mode");
-  logError("WiFi reconnect: all saved networks failed");
-  wifiApplyPowerPolicy();
+
+  // Soft reconnect hanya ke SSID terakhir yang pernah sukses.
+  const char *target = staSSID.length() ? staSSID.c_str() : savedWiFi[0].ssid;
+  const char *pass = nullptr;
+  for (int i = 0; i < savedWiFiCount; i++) {
+    if (strcmp(savedWiFi[i].ssid, target) == 0) {
+      pass = savedWiFi[i].pass;
+      break;
+    }
+  }
+  if (!pass) {
+    wifiApSetupMode = true;
+    wifiStaEverOk = false;
+    wifiEnsureApAlive();
+    return;
+  }
+
+  Serial.printf("[WiFi] Soft reconnect to %s...\n", target);
+  if (WiFi.getMode() == WIFI_AP) {
+    WiFi.mode(WIFI_AP_STA);
+    pumpDelay(50);
+  }
+  WiFi.begin(target, pass);
+  unsigned long start = millis();
+  while (millis() - start < 8000) {
+    wifiServicePump();
+    if (WiFi.status() == WL_CONNECTED) break;
+    delay(20);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiMarkStaConnected(target);
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    wifiApplyPowerPolicy();
+    Serial.printf("[WiFi] Reconnected %s | %s\n", staSSID.c_str(), staIP.c_str());
+    return;
+  }
+
+  Serial.println("[WiFi] Soft reconnect failed — AP setup tanpa restart softAP");
+  logError("WiFi soft reconnect failed");
+  wifiStaEverOk = false;
+  wifiApSetupMode = true;
+  WiFi.disconnect(true);
+  pumpDelay(50);
+  wifiEnsureApAlive();
 }
 
 void watchdogCheck() {
   if (!autoScan || enrollActive || restoreActive) return;
+  if (scanSleeping) return; // jadwal tidur (mis. 00:00–05:00): scan sengaja mati — jangan reinit
+  if (attnUploading || cacheSyncBusy || httpsBusy) return; // jangan reinit saat HTTPS
   if (scanState != SCAN_IDLE) return; // jangan ganggu saat scan/proses berjalan
   if (millis() - lastScanActivity < SCAN_WATCHDOG_MS) return;
 
@@ -3453,6 +6111,8 @@ void setup() {
   credLoad();
   dbLoad();
   settingsLoad();
+  pendingAttLoad();
+  pendingRegLoad();
 
   // Gate kehadiran jari (T-OUT / IR) — pinMode + kalibrasi dijalankan di
   // AKHIR setup (lihat di bawah) setelah TTP233D stabilisasi.
@@ -3502,6 +6162,9 @@ void setup() {
   server.on("/api/branches", HTTP_OPTIONS, handleBranches);
   server.on("/api/employees", HTTP_GET, handleEmployees);
   server.on("/api/employees", HTTP_OPTIONS, handleEmployees);
+  server.on("/api/cache/status", HTTP_GET, handleCacheStatus);
+  server.on("/api/cache/refresh", HTTP_POST, handleCacheRefresh);
+  server.on("/api/cache/refresh", HTTP_OPTIONS, handleCacheRefresh);
   // Backup / Restore API
   server.on("/api/backup", HTTP_GET, handleBackup);
   server.on("/api/backup/full", HTTP_GET, handleBackupFull);
@@ -3521,30 +6184,42 @@ void setup() {
 
   server.on("/api/debug/log", HTTP_GET, handleDebugLog);
   server.on("/api/debug/errors", HTTP_GET, handleErrorLog);
+  // Captive portal probes (Android / iOS / Windows / Kindle)
+  server.on("/generate_204", handleCaptiveProbe);
+  server.on("/gen_204", handleCaptiveProbe);
+  server.on("/hotspot-detect.html", handleCaptiveProbe);
+  server.on("/library/test/success.html", handleCaptiveProbe);
+  server.on("/ncsi.txt", handleCaptiveProbe);
+  server.on("/connecttest.txt", handleCaptiveProbe);
+  server.on("/canonical.html", handleCaptiveProbe);
+  server.on("/success.txt", handleCaptiveProbe);
+  server.on("/chrome-variations/seed", handleCaptiveProbe);
   server.onNotFound(handleNotFound);
   server.begin();
 
-  // ── BLE ──
-  bleInit();
+  attnInit();
+  cacheInitWorker();
+  syncInit();
+
+  // Kalau boot langsung AP-only, nyalakan captive DNS
+  if (wifiApSetupMode) wifiDnsStart();
 
   lcdProgress(45);
 
   // ── Fingerprint sensor auto-detect ──
   // ESP32 HardwareSerial lebih stabil dari ESP8266 SoftwareSerial.
-  // WiFi OFF saat deteksi untuk keandalan maksimal.
-  Serial.println("[SENSOR] Detecting sensor (WiFi OFF)...");
+  Serial.println("[SENSOR] Detecting sensor (WiFi ON)...");
   lcdEnrollStep("Init Sensor", -1, "Deteksi sensor...", COL_ACCENT);
 
-  // Simpan status WiFi lalu matikan
+  // Simpan status WiFi
   bool wasWifiConnected = wifiConnected;
   String wasStaIP = staIP;
   String wasStaSSID = staSSID;
 
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  delay(100);
-  Serial.println("[SENSOR] WiFi OFF for sensor detection");
-  yield();
+  // WiFi TIDAK dimatikan — sensor di HardwareSerial UART2, tidak terganggu
+  // interrupt WiFi (beda dengan NodeMCU/SoftwareSerial). AP tetap hidup agar
+  // web UI tetap bisa diakses selama boot.
+  Serial.println("[SENSOR] Detecting sensor (WiFi ON)...");
 
   // Tunggu sensor stabilisasi (power-on reset, 3.3V perlu lebih lama)
   delay(3000);
@@ -3570,6 +6245,17 @@ void setup() {
         curBaud = baud;
         ok = true;
         Serial.printf("[SENSOR] FOUND at %lu (attempt %d)\n", curBaud, attempt + 1);
+        // Klon FPM10A LED menyala dari power-on sampai dikontrol 0x50/0x51.
+        // Matikan SEGERA setelah sensor berespon, supaya boot tidak tampak
+        // "LED nyala terus". Ini penting: setup masih panjang (BLE, gate
+        // calibration) yang bisa makan waktu detik — LED harus mati sekarang.
+        ledOn = false;
+        uint8_t ledR = finger.LEDcontrol(false);
+        if (ledR != FINGERPRINT_OK) {
+          Serial.printf("[LED] boot OFF failed code=%d (retry nanti)\n", ledR);
+        } else {
+          Serial.println("[LED] boot OFF");
+        }
       } else {
         delay(100);
         flushRX();
@@ -3577,42 +6263,30 @@ void setup() {
     }
   }
 
-  // Hidupkan WiFi kembali
-  Serial.println("[SENSOR] Re-enabling WiFi...");
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.setSleep(false);
-  WiFi.softAP(AP_SSID, cred.apPass);
-  if (wasWifiConnected && wasStaSSID.length() > 0) {
-    for (int i = 0; i < savedWiFiCount; i++) {
-      if (String(savedWiFi[i].ssid) == wasStaSSID) {
-        WiFi.begin(savedWiFi[i].ssid, savedWiFi[i].pass);
-        break;
-      }
-    }
-    unsigned long start = millis();
-    while (millis() - start < 10000) {
-      if (WiFi.status() == WL_CONNECTED) break;
-      delay(100);
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      wifiConnected = true;
-      staIP = WiFi.localIP().toString();
-      staSSID = wasStaSSID;
+  // WiFi tetap hidup sepanjang deteksi — tidak perlu re-enable.
+  if (wasWifiConnected && wasStaSSID.length() > 0 && wifiStaEverOk) {
+    // Sudah STA sebelum deteksi sensor — pastikan masih connect; kalau putus, soft reconnect sekali.
+    if (WiFi.status() != WL_CONNECTED) {
+      wifiReconnect();
+    } else {
+      wifiMarkStaConnected(wasStaSSID.c_str());
       WiFi.softAPdisconnect(true);
       WiFi.mode(WIFI_STA);
       wifiApplyPowerPolicy();
-      Serial.printf("[WiFi] Reconnected to %s | IP: %s | sleep ON\n", staSSID.c_str(), staIP.c_str());
-    } else {
-      wifiConnected = false;
-      wifiApplyPowerPolicy();
-      Serial.println("[WiFi] Reconnect failed, AP mode");
     }
-  } else {
-    wifiApplyPowerPolicy();
-    Serial.println("[WiFi] AP mode active");
+  } else if (!wifiConnected) {
+    // Boot tanpa STA / gagal connect → kunci AP-only (jangan tinggal AP_STA scan).
+    wifiEnterApOnly("post-sensor-ap");
   }
 
   lcdProgress(80);
+
+  // ── BLE ──
+  // Inisialisasi BLE SETELAH WiFi stabil. Jangan init BLE lalu matikan
+  // WiFi (WiFi.mode(WIFI_OFF) untuk deteksi sensor): BLE & WiFi berbagi
+  // radio yang sama → coexist rusak → advertising mati diam-diam meski
+  // log "Advertising started" muncul.
+  bleInit();
 
   finger.getParameters();
   if (ok) finger.setSecurityLevel(FINGERPRINT_SECURITY_LEVEL_2);  // 3.3V: gambar kurang detail
@@ -3662,18 +6336,147 @@ void setup() {
 
   emit(F("{\"event\":\"ready\",\"found\":%s,\"baud\":%lu,\"security\":%d}"),
        ok ? "true" : "false", curBaud, finger.security_level);
+
+  // Tunda sync cache pertama ±30 menit — populate on-demand saat buka tab Daftar
+  // atau lewat tombol Refresh (hindari blok boot dengan unduhan 49KB).
+  lastCacheSyncMs = millis();
+  cacheEnsureDir();
 }
 
 // ────────────────────────────────────────────────────────────────────
 //  LOOP
 // ────────────────────────────────────────────────────────────────────
 void loop() {
-  // BLE WiFi save — simpan + langsung coba connect
+  // BLE WiFi — simpan kredensial + connect non-blocking (sama logika web UI)
+  static bool bleWifiConnectActive = false;
+  static unsigned long bleWifiConnectStart = 0;
+  static bool bleWifiWasAuto = false;
+
   if (bleWifiSaveRequested) {
     bleWifiSaveRequested = false;
-    bleSaveWifi(bleWifiSsid, bleWifiPass);
-    // Trigger connect langsung (jangan tunggu 30s auto-reconnect)
-    WiFi.begin(bleWifiSsid, bleWifiPass);
+    wifiLoadCreds();
+    if (!storageReady || !wifiAddCreds(bleWifiSsid, bleWifiPass)) {
+      bleNotifyEvent("{\"event\":\"wifi_saved\",\"ok\":false}");
+    } else {
+      bleNotifyEvent("{\"event\":\"wifi_saved\",\"ok\":true}");
+      bleWifiWasAuto = autoScan;
+      wifiOpsBegin();
+      if (appSettings.apEnabled) {
+        if (WiFi.getMode() == WIFI_STA) {
+          WiFi.mode(WIFI_AP_STA);
+          WiFi.softAP(AP_SSID, cred.apPass);
+        }
+      } else {
+        WiFi.mode(WIFI_STA);
+        WiFi.softAPdisconnect(true);
+      }
+      WiFi.setSleep(false);
+      WiFi.begin(bleWifiSsid, bleWifiPass);
+      bleWifiConnectActive = true;
+      bleWifiConnectStart = millis();
+      bleNotifyEvent("{\"event\":\"wifi_connecting\"}");
+      Serial.printf("[BLE] WiFi connect start: %s\n", bleWifiSsid);
+    }
+  }
+
+  if (bleWifiConnectActive) {
+    lastScanActivity = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      bleWifiConnectActive = false;
+      wifiMarkStaConnected(bleWifiSsid);
+      WiFi.softAPdisconnect(true);
+      WiFi.mode(WIFI_STA);
+      wifiApplyPowerPolicy();
+      bleUpdateStatus();
+      bleUpdateSettings();
+      char ev[160];
+      snprintf(ev, sizeof(ev),
+        "{\"event\":\"wifi_connected\",\"ssid\":\"%s\",\"ip\":\"%s\"}",
+        staSSID.c_str(), staIP.c_str());
+      bleNotifyEvent(ev);
+      wifiOpsEnd(bleWifiWasAuto);
+      Serial.printf("[BLE] WiFi connected %s | %s\n", staSSID.c_str(), staIP.c_str());
+    } else if (millis() - bleWifiConnectStart > 15000) {
+      bleWifiConnectActive = false;
+      logError("BLE WiFi connect timeout ssid=%s", bleWifiSsid);
+      wifiEnterApOnly("ble-connect-failed");
+      bleNotifyEvent("{\"event\":\"wifi_failed\",\"reason\":\"timeout\"}");
+      wifiOpsEnd(bleWifiWasAuto);
+      Serial.printf("[BLE] WiFi connect failed: %s\n", bleWifiSsid);
+    }
+  }
+
+  // BLE WiFi scan — progressive scan lalu kirim SSID satu-per-satu via notify
+  static bool bleWifiScanPendingDone = false;
+  static bool bleWifiScanStreaming = false;
+  static int bleWifiScanSendIdx = 0;
+
+  if (bleWifiScanRequested) {
+    bleWifiScanRequested = false;
+    if (wifiScanPhase == 1 || bleWifiScanStreaming) {
+      bleNotifyEvent("{\"event\":\"wifi_scan\",\"status\":\"busy\"}");
+    } else if (cacheSyncBusy || attnUploading || httpsBusy) {
+      bleNotifyEvent("{\"event\":\"wifi_scan\",\"status\":\"busy\",\"reason\":\"https\"}");
+    } else if (!wifiScanStart("ble")) {
+      bleNotifyEvent("{\"event\":\"wifi_scan\",\"status\":\"busy\"}");
+    } else {
+      bleWifiScanPendingDone = true;
+      bleNotifyEvent("{\"event\":\"wifi_scan\",\"status\":\"scanning\"}");
+      Serial.println("[BLE] WiFi scan started");
+    }
+  }
+
+  if (bleWifiScanPendingDone && wifiScanPhase == 2) {
+    bleWifiScanPendingDone = false;
+    wifiScanSortByRssi();
+    bleWifiScanSendIdx = 0;
+    bleWifiScanStreaming = true;
+  }
+
+  if (bleWifiScanStreaming) {
+    // Kirim max 1 AP per loop agar notify BLE tidak drop.
+    while (bleWifiScanSendIdx < wifiScanCount) {
+      const char *ssid = wifiScanAps[bleWifiScanSendIdx].ssid;
+      int rssi = wifiScanAps[bleWifiScanSendIdx].rssi;
+      bool enc = wifiScanAps[bleWifiScanSendIdx].enc;
+      uint8_t ch = wifiScanAps[bleWifiScanSendIdx].channel;
+      int idx = bleWifiScanSendIdx++;
+      if (!ssid[0] || wifiScanAps[idx].hidden) continue;
+      // Skip duplikat SSID yang sudah dikirim (ambil RSSI terbaik karena sudah sorted)
+      bool dup = false;
+      for (int j = 0; j < idx; j++) {
+        if (wifiScanAps[j].ssid[0] && strcmp(wifiScanAps[j].ssid, ssid) == 0) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) continue;
+      char esc[40];
+      int e = 0;
+      for (const char *s = ssid; *s && e < (int)sizeof(esc) - 1; s++) {
+        char c = *s;
+        if (c == '"' || c == '\\') {
+          if (e < (int)sizeof(esc) - 2) esc[e++] = '\\';
+        }
+        if (c >= 32 && c != 127) esc[e++] = c;
+      }
+      esc[e] = 0;
+      char ev[128];
+      snprintf(ev, sizeof(ev),
+        "{\"event\":\"wifi_scan_ap\",\"ssid\":\"%s\",\"rssi\":%d,\"enc\":%s,\"ch\":%u}",
+        esc, rssi, enc ? "true" : "false", (unsigned)ch);
+      bleNotifyEvent(ev);
+      break; // satu per iterasi
+    }
+    if (bleWifiScanSendIdx >= wifiScanCount) {
+      bleWifiScanStreaming = false;
+      wifiScanPhase = 0;
+      char done[80];
+      snprintf(done, sizeof(done),
+        "{\"event\":\"wifi_scan\",\"status\":\"done\",\"count\":%d}", wifiScanCount);
+      bleNotifyEvent(done);
+      Serial.printf("[BLE] WiFi scan sent done count=%d\n", wifiScanCount);
+    }
   }
 
   // BLE Enroll — blocking seperti web UI enroll, jalan di main loop
@@ -3689,13 +6492,50 @@ void loop() {
         const char *eid = doc["employeeId"] | "";
         const char *nm  = doc["name"] | "";
         if (eid[0] && nm[0]) {
-          bool wasAuto = autoScan;
+          // Bersihkan state scan/LED yang mungkin macet setelah uji sentuh + BLE connect.
+          sensorResumeIdle("pre-enroll");
           autoScan = false;
-          enrollFinger(0, nm, eid);  // id=0 → auto-assign
-          autoScan = wasAuto;
-          if (autoScan) { ledOn = false; finger.LEDcontrol(false); scanState = SCAN_IDLE; }
+          bleWakeUi();
+          Serial.printf("[BLE] starting enroll name=%s emp=%s\n", nm, eid);
+          uint8_t enrollRes = enrollFinger(0, nm, eid);  // id=0 → auto-assign
+          // Pastikan kembali siap scan absensi — jangan biarkan LED/gate tersangkut.
+          sensorResumeIdle("post-enroll");
+          lcdShowIdle();
+          bleUpdateStatus();
+          Serial.printf("[BLE] enroll finished res=%u — autoscan ON\n", enrollRes);
+          // Jika enroll gagal karena sensor error (bukan batal 0xFD), coba
+          // reinit sensor supaya LED & scan pulih — jangan biarkan macet.
+          if (enrollRes != 0xFD && enrollRes != FINGERPRINT_OK) {
+            Serial.printf("[BLE] enroll failed res=%u → sensor reinit\n", enrollRes);
+            logError("enroll failed res=%u — reinit sensor", enrollRes);
+            delay(300);
+            flushRX();
+            reinitSensor();
+            sensorResumeIdle("post-enroll-reinit");
+            bleUpdateStatus();
+          }
         }
       }
+    }
+  }
+
+  // BLE Delete — hapus sidik jari dari sensor + DB lokal
+  if (bleDeleteRequested) {
+    bleDeleteRequested = false;
+    uint8_t id = bleDeleteId;
+    Serial.printf("[BLE] delete id=%u\n", id);
+    if (id > 0 && id <= 100) {
+      int p = finger.deleteModel(id);
+      if (p == FINGERPRINT_OK) {
+        dbRemove(id);
+        emit(F("{\"event\":\"deleted\",\"id\":%u,\"ok\":true}"), id);
+      } else {
+        Serial.printf("[BLE] deleteModel failed code=%d\n", p);
+        emit(F("{\"event\":\"deleted\",\"id\":%u,\"ok\":false,\"code\":%d}"), id, p);
+      }
+      finger.getTemplateCount();
+      bleUpdateStatus();
+      lcdShowIdle();
     }
   }
 
@@ -3705,49 +6545,82 @@ void loop() {
     watchdogCheck();
     delay(40);
   } else {
-    // auto reconnect sensor
-    static unsigned long lastRetry = 0;
-    if (millis() - lastRetry > 5000) {
-      lastRetry = millis();
-      Serial.println("[LOOP] Trying sensor reconnect...");
-      if (reinitSensor()) {
-        Serial.println("[LOOP] Sensor reconnected!");
-        recoveryCount = 0;
-        wifiReconnect();
-      } else {
-        recoveryCount++;
-        Serial.printf("[LOOP] Reconnect failed (%d/%d)\n", recoveryCount, MAX_RECOVERY);
-        logError("loop sensor reconnect failed count=%d", recoveryCount);
-        WiFi.mode(WIFI_AP);
-        WiFi.setSleep(false);
-        WiFi.softAP(AP_SSID, cred.apPass);
-        if (recoveryCount >= MAX_RECOVERY) {
-          Serial.println("[LOOP] Max recovery → soft wait (no reboot)");
-          logError("loop sensor max recovery reached");
-          emit(F("{\"event\":\"sensor_wait\"}"));
+    // autoScan off. Dua kasus berbeda:
+    //   a) User/app sengaja matikan autoscan (mis. sebelum enroll BLE) — sensor
+    //      SEHAT, jangan reinit! reinitSensor() mem-blokir loop ~15 detik dan
+    //      menahan permintaan enroll yang masuk → "enroll tidak merespon / delay 5s".
+    //   b) Sensor benar-benar mati (sensorReady=false) — baru reinit berkala.
+    // Guard dengan !sensorReady supaya mode enroll tidak memicu reconnect.
+    wifiEnsureApAlive();
+    if (sensorReady) {
+      // Sensor sehat, hanya autoscan dimatikan (enroll/uji). Jangan reinit.
+      delay(20);
+    } else {
+      static unsigned long lastRetry = 0;
+      // Jangan reinit tiap 5s (blokir AP). Coba tiap 30s saja.
+      if (millis() - lastRetry > 30000) {
+        lastRetry = millis();
+        Serial.println("[LOOP] Trying sensor reconnect...");
+        if (reinitSensor()) {
+          Serial.println("[LOOP] Sensor reconnected!");
           recoveryCount = 0;
-          lastScanActivity = millis();
-          delay(10000);
+          // Hanya soft-reconnect STA jika memang pernah STA; AP setup: no-op aman
+          if (!wifiApSetupMode) wifiReconnect();
+        } else {
+          recoveryCount++;
+          Serial.printf("[LOOP] Sensor still down (%d) — AP tetap aktif\n", recoveryCount);
+          logError("loop sensor reconnect failed count=%d", recoveryCount);
+          wifiEnsureApAlive();
+          if (recoveryCount >= MAX_RECOVERY) {
+            Serial.println("[LOOP] Max sensor recovery — idle, keep serving AP");
+            logError("loop sensor max recovery reached");
+            emit(F("{\"event\":\"sensor_wait\"}"));
+            recoveryCount = 0;
+            lastScanActivity = millis();
+            // Jangan delay(10000) blocking — cukup perpanjang interval via lastRetry
+            lastRetry = millis();
+          }
         }
       }
+      delay(20);
     }
-    delay(50);
   }
 
-  // Housekeeping
+  // Web client tiap iterasi — jangan di-throttle (request HTML besar butuh
+  // banyak chunk TCP; kalau jarang di-poll, koneksi timeout / blank).
+  wifiScanService();
+  attnServiceUi();
+  cacheEmpJobTick();
+  if (dnsServerActive) dnsServer.processNextRequest();
+  server.handleClient();
+
+  // Housekeeping (lebih jarang)
   static uint8_t hkTick = 0;
   hkTick++;
   if (hkTick >= 2) {
     hkTick = 0;
-    server.handleClient();
     timeClient.update();
     checkAutoSleep();
+    cacheBackgroundTick();
 
-    // BLE status update setiap 5 detik
+    // Auto-sync pending (register/attendance) sesuai uploadIntervalMinutes.
+    static unsigned long lastAutoSync = 0;
+    if (appSettings.uploadIntervalMinutes > 0 &&
+        (lastAutoSync == 0 || millis() - lastAutoSync >= (unsigned long)appSettings.uploadIntervalMinutes * 60000UL)) {
+      lastAutoSync = millis();
+      if (pendingRegCount > 0 || pendingAttCount > 0) {
+        Serial.printf("[SYNC] periodic trigger (pendingReg=%d pendingAtt=%d)\n",
+                      pendingRegCount, pendingAttCount);
+        syncRequestNow();
+      }
+    }
+
+    // BLE status + pastikan advertising tetap hidup (selalu siap di-scan)
     static unsigned long lastBleStatus = 0;
     if (millis() - lastBleStatus > 5000) {
       lastBleStatus = millis();
       bleUpdateStatus();
+      bleEnsureAdvertising();
     }
 
     // TX power saja — jangan ganti mode WiFi berkala (putus web UI)
@@ -3756,31 +6629,53 @@ void loop() {
       lastPowerPolicy = millis();
       wifiApplyPowerPolicy();
 
-      // Auto-reconnect saat WiFi drop (tiap 60 detik coba lagi)
-      if (!wifiConnected && savedWiFiCount > 0) {
+      // Sync flag jika STA putus sendiri (router mati, dll).
+      if (wifiStaEverOk && !wifiApSetupMode && WiFi.status() != WL_CONNECTED) {
+        wifiConnected = false;
+        // JANGAN set wifiApSetupMode=true di sini — itu mematikan soft reconnect
+        // (blok di bawah butuh !wifiApSetupMode). Soft reconnect / AP-only
+        // setelah retry yang menata ulang mode.
+      }
+
+      // Soft reconnect HANYA jika sebelumnya sudah pernah STA sukses lalu putus.
+      // Saat AP setup (belum pernah connect / boot gagal) → JANGAN paksa WiFi.begin
+      // (itu yang bikin AP tidak stabil).
+      if (wifiStaEverOk && !wifiApSetupMode && !wifiConnected && savedWiFiCount > 0) {
         static unsigned long lastWifiRetry = 0;
-        if (millis() - lastWifiRetry > 30000) {
+        static uint8_t wifiDropRetries = 0;
+        if (millis() - lastWifiRetry > 60000) {
           lastWifiRetry = millis();
-          Serial.println("[WiFi] Auto-reconnect attempt...");
-          for (int i = 0; i < savedWiFiCount; i++) {
-            WiFi.begin(savedWiFi[i].ssid, savedWiFi[i].pass);
-            unsigned long st = millis();
-            while (millis() - st < 6000)
-              if (WiFi.status() == WL_CONNECTED) break; else delay(100);
-            if (WiFi.status() == WL_CONNECTED) {
-              wifiConnected = true; staIP = WiFi.localIP().toString();
-              staSSID = String(savedWiFi[i].ssid);
-              Serial.printf("[WiFi] Reconnected %s | %s\n", staSSID.c_str(), staIP.c_str());
-              break;
-            }
-            WiFi.disconnect(); delay(200);
+          wifiDropRetries++;
+          Serial.printf("[WiFi] Soft reconnect after drop (%u/3)...\n", wifiDropRetries);
+          wifiReconnect();
+          if (wifiConnected) {
+            wifiDropRetries = 0;
+          } else if (wifiDropRetries >= 3) {
+            // Setelah 3x gagal → kunci AP-only, biar user set ulang dari web
+            wifiDropRetries = 0;
+            wifiStaEverOk = false;
+            wifiEnterApOnly("drop-retries-exhausted");
           }
+        }
+      } else if (wifiApSetupMode) {
+        // Setup mode harus AP_STA (AP hidup + STA idle). WIFI_OFF/STA-only = rusak.
+        // Pastikan tidak ada STA reconnect hang yang hop channel.
+        if (WiFi.status() != WL_CONNECTED) {
+          WiFi.disconnect(false);
+        }
+        wifi_mode_t m = WiFi.getMode();
+        if (m != WIFI_AP_STA && m != WIFI_AP) {
+          Serial.println("[WiFi] AP-setup guard: restore without client kick");
+          wifiEnsureApAlive();
+        } else if (WiFi.softAPIP() == IPAddress(0, 0, 0, 0)) {
+          WiFi.softAP(AP_SSID, cred.apPass);
         }
       }
     }
 
-    // Matikan backlight dan hentikan refresh LCD setelah lama tanpa sentuhan.
-    if (lcdBacklightOn && millis() - lastLcdActivity > LCD_IDLE_TIMEOUT_MS) {
+    // Mode scan idle > 60s: matikan backlight total.
+    // Mode enroll / daftar / restore wajib tetap hidup sampai proses selesai atau dibatalkan.
+    if (lcdBacklightOn && !enrollActive && !restoreActive && millis() - lastLcdActivity > LCD_IDLE_TIMEOUT_MS) {
       ledcWrite(LCD_BL, 0);
       lcdBacklightOn = false;
     }

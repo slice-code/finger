@@ -1,7 +1,17 @@
 node_modules/
 dist/
-android-pjtki/app/build/
-android-pjtki/.gradle/
 *.apk
 *.log
 esp32-fpm10a-versi-3v3/*.ino.bak
+
+# Flutter app (android-pjtki)
+android-pjtki/.dart_tool/
+android-pjtki/build/
+android-pjtki/.gradle/
+android-pjtki/.idea/
+android-pjtki/*.iml
+android-pjtki/android/.gradle/
+android-pjtki/android/build/
+android-pjtki/android/local.properties
+android-pjtki/android/app/build/
+android-pjtki/android/app/.cxx/
