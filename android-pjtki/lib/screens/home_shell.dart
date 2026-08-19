@@ -20,19 +20,21 @@ class HomeShell extends StatefulWidget {
 
 class _HomeShellState extends State<HomeShell> {
   int _index = 0;
+  final _staffKey = GlobalKey<AppKaryawanScreenState>();
 
-  static const _pages = [
-    DashboardScreen(),
-    KaryawanScreen(),
-    AppKaryawanScreen(),
-    RiwayatScreen(),
-    SyncScreen(),
-    SetelanScreen(),
-  ];
+  late final List<Widget> _pages;
 
   @override
   void initState() {
     super.initState();
+    _pages = [
+      const DashboardScreen(),
+      const KaryawanScreen(),
+      AppKaryawanScreen(key: _staffKey),
+      const RiwayatScreen(),
+      const SyncScreen(),
+      const SetelanScreen(),
+    ];
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       context.read<BleService>().restoreLastDevice();
@@ -171,7 +173,10 @@ class _HomeShellState extends State<HomeShell> {
                 ),
               NavigationBar(
                 selectedIndex: _index,
-                onDestinationSelected: (i) => setState(() => _index = i),
+                onDestinationSelected: (i) {
+                  setState(() => _index = i);
+                  if (i == 2) _staffKey.currentState?.reload();
+                },
                 destinations: const [
                   NavigationDestination(
                     icon: Icon(Icons.home_outlined),

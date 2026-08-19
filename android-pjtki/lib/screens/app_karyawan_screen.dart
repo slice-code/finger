@@ -12,10 +12,10 @@ class AppKaryawanScreen extends StatefulWidget {
   const AppKaryawanScreen({super.key});
 
   @override
-  State<AppKaryawanScreen> createState() => _AppKaryawanScreenState();
+  State<AppKaryawanScreen> createState() => AppKaryawanScreenState();
 }
 
-class _AppKaryawanScreenState extends State<AppKaryawanScreen>
+class AppKaryawanScreenState extends State<AppKaryawanScreen>
     with SingleTickerProviderStateMixin {
   late final TabController _tabs;
   final _daftarKey = GlobalKey<_DaftarKaryawanTabState>();
@@ -28,6 +28,14 @@ class _AppKaryawanScreenState extends State<AppKaryawanScreen>
     _tabs.addListener(() {
       if (mounted) setState(() {});
     });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _daftarKey.currentState?.loadFromParent();
+    });
+  }
+
+  /// Dipanggil saat tab Staff dipilih di bottom nav (data server bisa baru di-update).
+  Future<void> reload() async {
+    await _daftarKey.currentState?.loadFromParent();
   }
 
   @override
@@ -103,8 +111,9 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
   @override
   void initState() {
     super.initState();
-    _load();
   }
+
+  Future<void> loadFromParent() => _load();
 
   List<AppKaryawan> get _filtered {
     if (_q.isEmpty) return _rows;
