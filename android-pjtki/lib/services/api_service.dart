@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
+
 import 'package:dio/dio.dart';
 import 'package:pointycastle/api.dart' as pc;
 import 'package:pointycastle/block/aes.dart';
@@ -103,6 +104,43 @@ class ApiService {
     settings.authName = data['name']?.toString() ?? '';
     settings.userKodeCabang = data['kode_cabang']?.toString() ?? '';
     return data;
+  }
+
+  /// Perbarui JWT tanpa password (POST /api/auth/refresh).
+  Future<Map<String, dynamic>> refreshAuthToken() async {
+    if (settings.authToken.isEmpty) {
+      throw Exception('Belum login');
+    }
+    final res = await _dio.post(
+      _url('/api/auth/refresh'),
+      options: Options(headers: _authHeaders()),
+    );
+    final body = res.data is Map
+        ? Map<String, dynamic>.from(res.data as Map)
+        : <String, dynamic>{};
+    if (body['success'] != true) {
+      throw Exception(body['error'] ?? 'Gagal memperbarui token');
+    }
+    final token = body['token']?.toString() ?? '';
+    if (token.isEmpty) throw Exception('Token baru tidak diterima');
+    settings.authToken = token;
+    final data = Map<String, dynamic>.from(body['data'] as Map? ?? {});
+    settings.authName = data['name']?.toString() ?? settings.authName;
+    settings.userKodeCabang = data['kode_cabang']?.toString() ?? '';
+    return data;
+  }
+
+  /// Logout BLK — hapus token lokal (+ optional panggil server).
+  Future<void> logout() async {
+    try {
+      if (settings.authToken.isNotEmpty) {
+        await _dio.post(
+          _url('/api/auth/logout'),
+          options: Options(headers: _authHeaders()),
+        );
+      }
+    } catch (_) {}
+    settings.clearAuth();
   }
 
   /// Profil user BLK saat ini (cabang dari JWT).

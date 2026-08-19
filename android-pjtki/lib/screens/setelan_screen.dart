@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -11,6 +12,7 @@ import '../services/settings_store.dart';
 import '../theme/app_theme.dart';
 import 'connect_screen.dart';
 import 'device_scan_screen.dart';
+import 'login_screen.dart';
 
 class WifiApInfo {
   final String ssid;
@@ -49,6 +51,86 @@ class _SetelanScreenState extends State<SetelanScreen> {
   String _statusMsg = '';
   StreamSubscription? _bleSub;
   final List<WifiApInfo> _wifiAps = [];
+
+  bool _authBusy = false;
+
+  String _tokenStatusLabel(SettingsStore settings) {
+    final token = settings.authToken;
+    if (token.isEmpty) return 'Belum login';
+    try {
+      final parts = token.split('.');
+      if (parts.length < 2) return 'Token tidak valid';
+      var payload = parts[1];
+      payload = base64Url.normalize(payload);
+      final map = json.decode(utf8.decode(base64Url.decode(payload)));
+      final exp = map['exp'];
+      if (exp is! num) return 'Token aktif';
+      final expDt = DateTime.fromMillisecondsSinceEpoch(exp.toInt() * 1000);
+      if (DateTime.now().isAfter(expDt)) {
+        return 'Token kadaluarsa (${_fmtDt(expDt)})';
+      }
+      return 'Token aktif sampai ${_fmtDt(expDt)}';
+    } catch (_) {
+      return 'Token aktif';
+    }
+  }
+
+  String _fmtDt(DateTime dt) {
+    final l = dt.toLocal();
+    return '${l.day}/${l.month}/${l.year} ${l.hour.toString().padLeft(2, '0')}:${l.minute.toString().padLeft(2, '0')}';
+  }
+
+  Future<void> _refreshAuthToken() async {
+    setState(() {
+      _authBusy = true;
+      _statusMsg = 'Memperbarui token...';
+    });
+    try {
+      await context.read<ApiService>().refreshAuthToken();
+      if (!mounted) return;
+      setState(() => _statusMsg = 'Token login diperbarui');
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Token berhasil diperbarui')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      final msg = e.toString().replaceAll('Exception: ', '');
+      setState(() => _statusMsg = 'Gagal refresh token: $msg');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(msg)),
+      );
+    } finally {
+      if (mounted) setState(() => _authBusy = false);
+    }
+  }
+
+  Future<void> _logout() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Keluar dari akun?'),
+        content: const Text(
+          'Token login akan dihapus. Anda perlu login ulang untuk akses Staff dan sync.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Batal')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Logout')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    setState(() => _authBusy = true);
+    try {
+      await context.read<ApiService>().logout();
+      if (!mounted) return;
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+        (_) => false,
+      );
+    } finally {
+      if (mounted) setState(() => _authBusy = false);
+    }
+  }
 
   @override
   void initState() {
@@ -536,6 +618,7 @@ class _SetelanScreenState extends State<SetelanScreen> {
   @override
   Widget build(BuildContext context) {
     final ble = context.watch<BleService>();
+    final settings = context.watch<SettingsStore>();
     final connected = ble.isConnected;
     final intervalValues = {
       ..._intervalChoices,
@@ -620,6 +703,72 @@ class _SetelanScreenState extends State<SetelanScreen> {
                         foregroundColor: AppTheme.danger),
                     child: const Text('Lepas'),
                   ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+
+          _section(
+            icon: Icons.account_circle_outlined,
+            title: 'Akun BLK',
+            subtitle: settings.authEmail.isNotEmpty
+                ? settings.authEmail
+                : 'Login untuk akses device & Staff',
+            accent: const Color(0xFF00897B),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                if (settings.authName.isNotEmpty)
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: PersonAvatar(name: settings.authName),
+                    title: Text(settings.authName,
+                        style: const TextStyle(fontWeight: FontWeight.w700)),
+                    subtitle: Text([
+                      if (settings.userKodeCabang.isNotEmpty)
+                        'Cabang ${settings.userKodeCabang}',
+                      _tokenStatusLabel(settings),
+                    ].join('\n')),
+                  )
+                else
+                  Text(
+                    _tokenStatusLabel(settings),
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: _authBusy || !settings.isLoggedIn
+                            ? null
+                            : _refreshAuthToken,
+                        icon: _authBusy
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.autorenew, size: 20),
+                        label: const Text('Refresh token'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed:
+                            _authBusy || !settings.isLoggedIn ? null : _logout,
+                        style: FilledButton.styleFrom(
+                          backgroundColor: AppTheme.danger,
+                        ),
+                        icon: const Icon(Icons.logout, size: 20),
+                        label: const Text('Logout'),
+                      ),
+                    ),
+                  ],
+                ),
               ],
             ),
           ),
