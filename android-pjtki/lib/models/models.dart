@@ -33,6 +33,32 @@ class DeviceStatus {
       uploadIntervalMinutes: (json['uploadIntervalMinutes'] as num?)?.toInt() ?? 120,
     );
   }
+
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        other is DeviceStatus &&
+            ready == other.ready &&
+            autoActive == other.autoActive &&
+            count == other.count &&
+            wifiMode == other.wifiMode &&
+            temp == other.temp &&
+            sensorReady == other.sensorReady &&
+            irEnabled == other.irEnabled &&
+            uploadIntervalMinutes == other.uploadIntervalMinutes;
+  }
+
+  @override
+  int get hashCode => Object.hash(
+        ready,
+        autoActive,
+        count,
+        wifiMode,
+        temp,
+        sensorReady,
+        irEnabled,
+        uploadIntervalMinutes,
+      );
 }
 
 class Employee {
@@ -47,6 +73,42 @@ class Employee {
       id: json['id']?.toString() ?? '',
       nama: json['nama']?.toString() ?? '',
       fingerTerdaftar: json['finger_terdaftar'] == true,
+    );
+  }
+}
+
+class FingerTemplate {
+  final String employeeId;
+  final String nama;
+  final int fingerId;
+  final bool hasHex;
+  final String kodeCabang;
+  final String hex;
+
+  FingerTemplate({
+    required this.employeeId,
+    required this.nama,
+    this.fingerId = 0,
+    this.hasHex = false,
+    this.kodeCabang = '',
+    this.hex = '',
+  });
+
+  factory FingerTemplate.fromJson(Map<String, dynamic> json) {
+    final hexStr =
+        json['template_hex']?.toString() ?? json['hex']?.toString() ?? '';
+    final hexOk = hexStr.length >= 512 ? hexStr.substring(0, 512) : hexStr;
+    return FingerTemplate(
+      employeeId: (json['employee_id'] ?? json['employeeId'])?.toString() ?? '',
+      nama: json['nama']?.toString() ?? json['name']?.toString() ?? '',
+      fingerId: (json['finger_id'] as num?)?.toInt() ??
+          (json['id'] as num?)?.toInt() ??
+          0,
+      hasHex: json['has_hex'] == true ||
+          hexOk.length == 512 ||
+          (json['template_hex']?.toString().length ?? 0) == 512,
+      kodeCabang: json['kode_cabang']?.toString() ?? '',
+      hex: hexOk,
     );
   }
 }
@@ -115,6 +177,89 @@ class AttendanceRecord {
       metode: hasLocal ? 'lokal' : json['metode_absen']?.toString(),
       deviceId: hasLocal ? null : json['device_id']?.toString(),
       synced: hasLocal ? syncedLocal : true,
+    );
+  }
+}
+
+/// Akun karyawan internal yang login ke mobile app (bukan CPMI/fingerprint).
+class AppKaryawan {
+  final int id;
+  final String? kodeKaryawan;
+  final String nama;
+  final String email;
+  final String? phone;
+  final String? kodeCabang;
+  final String? jabatan;
+  final String? departemen;
+  final String status;
+
+  AppKaryawan({
+    required this.id,
+    this.kodeKaryawan,
+    required this.nama,
+    required this.email,
+    this.phone,
+    this.kodeCabang,
+    this.jabatan,
+    this.departemen,
+    this.status = 'active',
+  });
+
+  bool get isActive => status == 'active';
+
+  factory AppKaryawan.fromJson(Map<String, dynamic> json) {
+    return AppKaryawan(
+      id: (json['id'] as num?)?.toInt() ?? 0,
+      kodeKaryawan: json['kode_karyawan']?.toString(),
+      nama: json['nama']?.toString() ?? '',
+      email: json['email']?.toString() ?? '',
+      phone: json['phone']?.toString(),
+      kodeCabang: json['kode_cabang']?.toString(),
+      jabatan: json['jabatan']?.toString(),
+      departemen: json['departemen']?.toString(),
+      status: json['status']?.toString() ?? 'active',
+    );
+  }
+}
+
+/// Absensi karyawan app (tabel karyawan_absensi di server).
+class KaryawanAbsensi {
+  final int id;
+  final int karyawanId;
+  final String nama;
+  final String tanggal;
+  final String? jamMasuk;
+  final String? jamPulang;
+  final String status;
+  final String? keterangan;
+  final String? metodeAbsen;
+  final String? kodeCabang;
+
+  KaryawanAbsensi({
+    required this.id,
+    required this.karyawanId,
+    required this.nama,
+    required this.tanggal,
+    this.jamMasuk,
+    this.jamPulang,
+    required this.status,
+    this.keterangan,
+    this.metodeAbsen,
+    this.kodeCabang,
+  });
+
+  factory KaryawanAbsensi.fromJson(Map<String, dynamic> json) {
+    return KaryawanAbsensi(
+      id: (json['id'] as num?)?.toInt() ?? 0,
+      karyawanId: (json['karyawan_id'] as num?)?.toInt() ?? 0,
+      nama: json['nama']?.toString() ?? '',
+      tanggal: json['tanggal']?.toString() ?? '',
+      jamMasuk: json['jam_masuk']?.toString(),
+      jamPulang: json['jam_pulang']?.toString(),
+      status: json['status']?.toString() ?? '',
+      keterangan: json['keterangan']?.toString(),
+      metodeAbsen: json['metode_absen']?.toString(),
+      kodeCabang: json['kode_cabang']?.toString(),
     );
   }
 }

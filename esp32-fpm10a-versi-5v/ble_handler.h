@@ -15,6 +15,7 @@
 #define BLE_CHAR_EVENTS_UUID    "4fafc207-1fb5-459e-8fcc-c5c9c331914b"
 #define BLE_CHAR_HISTORY_UUID   "4fafc208-1fb5-459e-8fcc-c5c9c331914b"
 #define BLE_CHAR_ENROLL_LIST_UUID "4fafc209-1fb5-459e-8fcc-c5c9c331914b"
+#define BLE_DEVICE_NAME         "PJTKI-Finger-5V"
 
 struct AppSettings;
 
@@ -44,7 +45,6 @@ extern bool bleCleanFingersRequested;
 extern char bleWifiSsid[33];
 extern char bleWifiPass[65];
 extern uint8_t bleDeleteId;
-// App Android → kirim template hex via BLE (unduh server di HP dulu).
 extern bool blePutTemplateWaitingHex;
 extern bool blePutTemplateProcess;
 extern char blePutTemplateEmpId[40];
@@ -161,7 +161,6 @@ class BLECmdCallback : public NimBLECharacteristicCallbacks {
         bleNotifyEvent("{\"event\":\"sync_templates_fail\",\"reason\":\"no_ids\"}");
       }
     } else if (cmd.startsWith("PUT_TEMPLATE ") || cmd.startsWith("PUT_TEMPLATE")) {
-      // Meta saja — hex 512 digit dikirim terpisah via char enroll-list (WRITE raw).
       int sp = cmd.indexOf(' ');
       if (sp >= 0) {
         String payload = cmd.substring(sp + 1);
@@ -570,7 +569,7 @@ void bleEnsureAdvertising() {
 }
 
 void bleInit() {
-  BLEDevice::init("PJTKI-Finger");
+  BLEDevice::init(BLE_DEVICE_NAME);
   NimBLEDevice::setMTU(517);
   // Power TX tinggi agar koneksi HP stabil (WiFi+BLE coexist).
   NimBLEDevice::setPower(9);  // ~+9 dBm
@@ -636,11 +635,11 @@ void bleInit() {
   NimBLEAdvertising *pAdv = BLEDevice::getAdvertising();
   pAdv->addServiceUUID(BLE_SERVICE_UUID);
   pAdv->enableScanResponse(true);
-  pAdv->setName("PJTKI-Finger");
+  pAdv->setName(BLE_DEVICE_NAME);
   pAdv->setMinInterval(160);   // 100ms
   pAdv->setMaxInterval(240);   // 150ms — mudah ditemukan HP
   BLEDevice::startAdvertising();
-  Serial.println("[BLE] Advertising started as 'PJTKI-Finger' (always-on)");
+  Serial.printf("[BLE] Advertising started as '%s' (always-on)\n", BLE_DEVICE_NAME);
 }
 
 void bleUpdateStatus() {

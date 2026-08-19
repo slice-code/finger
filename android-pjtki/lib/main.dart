@@ -3,25 +3,28 @@ import 'package:provider/provider.dart';
 
 import 'screens/connect_screen.dart';
 import 'screens/home_shell.dart';
+import 'screens/login_screen.dart';
 import 'services/api_service.dart';
 import 'services/ble_service.dart';
+import 'services/enroll_store.dart';
 import 'services/settings_store.dart';
+import 'theme/app_theme.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final settings = SettingsStore();
   await settings.init();
+  final enrollStore = EnrollStore();
+  await enrollStore.init();
   final api = ApiService(settings);
   final ble = BleService();
   ble.bindSettings(settings);
-  // JANGAN restore di sini (sebelum runApp) — permission dialog BLE belum bisa
-  // tampil & Android stack belum siap → koneksi gagal diam-diam.
-  // restoreLastDevice() dipanggil dari HomeShell setelah widget tree siap.
 
   runApp(
     MultiProvider(
       providers: [
         Provider.value(value: settings),
+        Provider.value(value: enrollStore),
         Provider.value(value: api),
         ChangeNotifierProvider.value(value: ble),
       ],
@@ -39,11 +42,13 @@ class PjtkiApp extends StatelessWidget {
     return MaterialApp(
       title: 'PJTKI Absensi',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1E88E5)),
-        useMaterial3: true,
-      ),
-      home: settings.isConfigured ? const HomeShell() : const ConnectScreen(),
+      theme: AppTheme.light(),
+      routes: {
+        '/home': (_) => const HomeShell(),
+      },
+      home: !settings.isLoggedIn
+          ? const LoginScreen()
+          : (settings.isConfigured ? const HomeShell() : const ConnectScreen()),
     );
   }
 }

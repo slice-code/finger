@@ -6,6 +6,7 @@ const String kDeleteCharUuid = "4fafc205-1fb5-459e-8fcc-c5c9c331914b";
 const String kSettingsCharUuid = "4fafc206-1fb5-459e-8fcc-c5c9c331914b";
 const String kEventsCharUuid = "4fafc207-1fb5-459e-8fcc-c5c9c331914b";
 const String kHistoryCharUuid = "4fafc208-1fb5-459e-8fcc-c5c9c331914b";
+const String kEnrollListCharUuid = "4fafc209-1fb5-459e-8fcc-c5c9c331914b";
 
 const String kDeviceNamePrefix = "PJTKI-Finger";
 // Harus http (bukan https) — ESP32 TLS ke Cloudflare sering gagal.

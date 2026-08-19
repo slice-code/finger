@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../models/models.dart';
 import '../services/ble_service.dart';
+import '../theme/app_theme.dart';
 import 'device_scan_screen.dart';
 
 class DashboardScreen extends StatefulWidget {
@@ -23,6 +24,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
     await context.read<BleService>().readStatus();
   }
 
+  Future<void> _disconnect() async {
+    final ble = context.read<BleService>();
+    if (ble.isConnecting || ble.isAutoReconnecting) {
+      await ble.disconnect(forget: true);
+      return;
+    }
+    if (!await confirmBleDisconnect(context, ble.connectedName)) return;
+    await ble.disconnect(forget: true);
+  }
+
   Future<void> _toggleAutoscan(bool value) async {
     final ble = context.read<BleService>();
     setState(() => _busy = true);
@@ -32,7 +43,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Gagal: ${e.toString().replaceAll('Exception: ', '')}')),
+          SnackBar(
+              content:
+                  Text('Gagal: ${e.toString().replaceAll('Exception: ', '')}')),
         );
       }
     } finally {
@@ -50,32 +63,51 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Dashboard'),
+        title: const Text('Beranda'),
         actions: [
           IconButton(
-            icon: const Icon(Icons.bluetooth_searching),
-            tooltip: 'Cari Device',
+            icon: const Icon(Icons.swap_horiz),
+            tooltip: 'Ganti koneksi',
             onPressed: _goScan,
           ),
+          if (connected)
+            IconButton(
+              icon: const Icon(Icons.bluetooth_disabled),
+              tooltip: 'Lepas koneksi',
+              onPressed: _disconnect,
+            ),
         ],
       ),
       body: ListView(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
         children: [
           _connectionCard(context, connected, connecting, deviceName),
-          const SizedBox(height: 12),
+          const SizedBox(height: 16),
           if (!connected && !connecting)
-            _emptyState()
+            AppEmptyState(
+              icon: Icons.bluetooth_searching,
+              title: 'Belum terhubung ke device',
+              subtitle:
+                  'Nyalakan ESP32, lalu cari PJTKI-Finger (3V3) atau PJTKI-Finger-5V.',
+              actionLabel: 'Cari device',
+              onAction: _goScan,
+            )
           else if (!connected && connecting)
-            _connectingState()
-          else
-            Column(
-              children: [
-                _statusGrid(context, status),
-                const SizedBox(height: 12),
-                _autoscanCard(context, status, connected),
-              ],
-            ),
+            const Padding(
+              padding: EdgeInsets.only(top: 48),
+              child: Column(
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 14),
+                  Text('Menunggu koneksi Bluetooth…'),
+                ],
+              ),
+            )
+          else ...[
+            _statusGrid(context, status),
+            const SizedBox(height: 16),
+            _autoscanCard(context, status, connected),
+          ],
         ],
       ),
     );
@@ -83,87 +115,153 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   Widget _connectionCard(
       BuildContext context, bool connected, bool connecting, String name) {
-    final active = connected || connecting;
+    final scheme = Theme.of(context).colorScheme;
     return Card(
-      color: connected ? const Color(0xFFE3F2FD) : Colors.grey.shade100,
       child: Padding(
         padding: const EdgeInsets.all(16),
-        child: Row(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Icon(
-              connected ? Icons.bluetooth_connected : Icons.bluetooth_disabled,
-              size: 40,
-              color: active ? const Color(0xFF1E88E5) : Colors.grey,
-            ),
-            const SizedBox(width: 16),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    connected
-                        ? name
-                        : (connecting ? 'Menghubungkan...' : 'Belum terhubung'),
-                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            Row(
+              children: [
+                Container(
+                  width: 52,
+                  height: 52,
+                  decoration: BoxDecoration(
+                    color: connected
+                        ? AppTheme.success.withValues(alpha: 0.12)
+                        : scheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(14),
                   ),
-                  Text(
+                  child: Icon(
                     connected
-                        ? 'Terhubung via BLE'
-                        : (connecting
-                            ? 'Mencoba konek ke device terakhir'
-                            : 'Ketuk ikon bluetooth untuk mencari'),
-                    style: const TextStyle(color: Colors.grey, fontSize: 13),
+                        ? Icons.bluetooth_connected
+                        : Icons.bluetooth_disabled,
+                    color: connected ? AppTheme.success : scheme.outline,
+                  ),
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        connected
+                            ? name
+                            : (connecting
+                                ? 'Menghubungkan…'
+                                : 'Belum terhubung'),
+                        style: const TextStyle(
+                            fontSize: 16, fontWeight: FontWeight.w800),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        connected
+                            ? 'Siap absensi via Bluetooth'
+                            : (connecting
+                                ? 'Mencoba device terakhir'
+                                : 'Hubungkan ESP32 untuk memulai'),
+                        style: TextStyle(
+                            color: scheme.onSurfaceVariant, fontSize: 13),
+                      ),
+                    ],
+                  ),
+                ),
+                if (connected)
+                  const StatusBadge(
+                      label: 'Online',
+                      color: AppTheme.success,
+                      icon: Icons.circle)
+                else if (connecting)
+                  const SizedBox(
+                    width: 22,
+                    height: 22,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                else
+                  FilledButton.tonal(
+                    onPressed: _goScan,
+                    style: FilledButton.styleFrom(
+                      minimumSize: const Size(0, 40),
+                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                    ),
+                    child: const Text('Hubungkan'),
+                  ),
+              ],
+            ),
+            if (connected || connecting) ...[
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.tonalIcon(
+                      onPressed: _goScan,
+                      style: FilledButton.styleFrom(
+                        minimumSize: const Size(0, 42),
+                      ),
+                      icon: const Icon(Icons.swap_horiz, size: 18),
+                      label: const Text('Ganti koneksi'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: _disconnect,
+                      style: OutlinedButton.styleFrom(
+                        minimumSize: const Size(0, 42),
+                        foregroundColor: AppTheme.danger,
+                      ),
+                      icon: const Icon(Icons.bluetooth_disabled, size: 18),
+                      label: Text(connecting ? 'Batal' : 'Lepas'),
+                    ),
                   ),
                 ],
               ),
-            ),
-            if (connecting)
-              const SizedBox(
-                width: 20,
-                height: 20,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              ),
+            ],
           ],
         ),
       ),
     );
   }
 
-  Widget _connectingState() {
-    return const Padding(
-      padding: EdgeInsets.only(top: 48),
-      child: Column(
-        children: [
-          CircularProgressIndicator(),
-          SizedBox(height: 12),
-          Text('Menunggu koneksi BLE...'),
-        ],
-      ),
-    );
-  }
-
-  Widget _emptyState() {
-    return const Padding(
-      padding: EdgeInsets.only(top: 48),
-      child: Column(
-        children: [
-          Icon(Icons.wifi_tethering_error, size: 64, color: Colors.grey),
-          SizedBox(height: 12),
-          Text('Hubungkan ke device ESP32 dulu'),
-        ],
-      ),
-    );
-  }
-
   Widget _statusGrid(BuildContext context, DeviceStatus s) {
     final items = <({String label, String value, IconData icon, Color color})>[
-      (label: 'Suhu', value: '${s.temp}°C', icon: Icons.thermostat, color: s.temp > 55 ? Colors.orange : Colors.green),
-      (label: 'Fingerprint', value: '${s.count}', icon: Icons.fingerprint, color: const Color(0xFF1E88E5)),
-      (label: 'Sensor', value: s.sensorReady ? 'Siap' : 'Error', icon: Icons.sensors, color: s.sensorReady ? Colors.green : Colors.red),
-      (label: 'WiFi', value: s.wifiMode == 'STA' ? 'STA' : 'AP', icon: Icons.wifi, color: const Color(0xFF1E88E5)),
-      (label: 'Gate IR', value: s.irEnabled ? 'Aktif' : 'Nonaktif', icon: Icons.gesture, color: Colors.purple),
-      (label: 'Mode', value: s.autoActive ? 'Scan Aktif' : 'Paused', icon: Icons.play_circle,
-          color: s.autoActive ? Colors.green : Colors.orange),
+      (
+        label: 'Suhu',
+        value: '${s.temp}°C',
+        icon: Icons.thermostat,
+        color: s.temp > 55 ? AppTheme.warning : AppTheme.success
+      ),
+      (
+        label: 'Sidik jari',
+        value: '${s.count} orang',
+        icon: Icons.fingerprint,
+        color: Theme.of(context).colorScheme.primary
+      ),
+      (
+        label: 'Sensor',
+        value: s.sensorReady ? 'Siap' : 'Error',
+        icon: Icons.sensors,
+        color: s.sensorReady ? AppTheme.success : AppTheme.danger
+      ),
+      (
+        label: 'WiFi',
+        value: s.wifiMode == 'STA' ? 'Terhubung' : 'Mode AP',
+        icon: Icons.wifi,
+        color: Theme.of(context).colorScheme.primary
+      ),
+      (
+        label: 'Gate sentuh',
+        value: s.irEnabled ? 'Aktif' : 'Mati',
+        icon: Icons.touch_app_outlined,
+        color: const Color(0xFF6A1B9A)
+      ),
+      (
+        label: 'Absensi',
+        value: s.autoActive ? 'Berjalan' : 'Dijeda',
+        icon: Icons.play_circle_outline,
+        color: s.autoActive ? AppTheme.success : AppTheme.warning
+      ),
     ];
     return GridView.count(
       crossAxisCount: 2,
@@ -171,28 +269,39 @@ class _DashboardScreenState extends State<DashboardScreen> {
       physics: const NeverScrollableScrollPhysics(),
       mainAxisSpacing: 10,
       crossAxisSpacing: 10,
-      mainAxisExtent: 72,
+      childAspectRatio: 2.05,
       children: items
           .map((e) => Card(
-                color: e.color,
                 child: Padding(
-                  padding: const EdgeInsets.all(12),
+                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
                   child: Row(
                     children: [
-                      Icon(e.icon, color: Colors.white),
-                      const SizedBox(width: 8),
+                      Container(
+                        width: 36,
+                        height: 36,
+                        decoration: BoxDecoration(
+                          color: e.color.withValues(alpha: 0.14),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Icon(e.icon, color: e.color, size: 20),
+                      ),
+                      const SizedBox(width: 10),
                       Expanded(
                         child: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(e.label,
-                                style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                                style: TextStyle(
+                                    color: Theme.of(context)
+                                        .colorScheme
+                                        .onSurfaceVariant,
+                                    fontSize: 12)),
                             Text(e.value,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
                                 style: const TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 16)),
+                                    fontWeight: FontWeight.w800, fontSize: 15)),
                           ],
                         ),
                       ),
@@ -209,9 +318,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
       child: SwitchListTile(
         value: s.autoActive,
         onChanged: connected && !_busy ? (v) => _toggleAutoscan(v) : null,
-        title: const Text('Auto Scan Fingerprint'),
-        subtitle: const Text('Sensor otomatis memindai jari'),
-        secondary: const Icon(Icons.autorenew),
+        title: const Text('Pindai otomatis',
+            style: TextStyle(fontWeight: FontWeight.w700)),
+        subtitle: const Text('Sensor memindai jari tanpa tombol'),
+        secondary: Icon(
+          Icons.fingerprint,
+          color: s.autoActive
+              ? AppTheme.success
+              : Theme.of(context).colorScheme.outline,
+        ),
       ),
     );
   }

@@ -8,6 +8,11 @@ class SettingsStore {
   static const _kApiKey = 'device_key';
   static const _kLastBleDeviceId = 'last_ble_device_id';
   static const _kLastBleDeviceName = 'last_ble_device_name';
+  static const _kEnrollCache = 'enroll_cache'; // JSON string daftar finger dari ESP32
+  static const _kAuthToken = 'auth_token'; // JWT login BLK (Bearer)
+  static const _kAuthEmail = 'auth_email';
+  static const _kAuthName = 'auth_name';
+  static const _kUserKodeCabang = 'user_kode_cabang'; // cabang dari login BLK (JWT)
 
   SharedPreferences? _prefs;
 
@@ -38,5 +43,32 @@ class SettingsStore {
   String get lastBleDeviceName => prefs.getString(_kLastBleDeviceName) ?? 'PJTKI-Finger';
   set lastBleDeviceName(String v) => prefs.setString(_kLastBleDeviceName, v);
 
+  /// Cache daftar fingerprint dari ESP32 (persist di storage app).
+  String get enrollCache => prefs.getString(_kEnrollCache) ?? '';
+  set enrollCache(String v) => prefs.setString(_kEnrollCache, v);
+
+  /// Token JWT dari login user BLK (untuk endpoint device/key).
+  String get authToken => prefs.getString(_kAuthToken) ?? '';
+  set authToken(String v) => prefs.setString(_kAuthToken, v);
+
+  String get authEmail => prefs.getString(_kAuthEmail) ?? '';
+  set authEmail(String v) => prefs.setString(_kAuthEmail, v);
+
+  String get authName => prefs.getString(_kAuthName) ?? '';
+  set authName(String v) => prefs.setString(_kAuthName, v);
+
+  /// Cabang user BLK dari login (bukan dari device fingerprint).
+  String get userKodeCabang => prefs.getString(_kUserKodeCabang) ?? '';
+  set userKodeCabang(String v) => prefs.setString(_kUserKodeCabang, v);
+
+  bool get isLoggedIn => authToken.isNotEmpty;
+
   bool get isConfigured => apiBaseUrl.isNotEmpty && apiKey.isNotEmpty;
+
+  void clearAuth() {
+    authToken = '';
+    authEmail = '';
+    authName = '';
+    userKodeCabang = '';
+  }
 }

@@ -11,11 +11,13 @@ Two hardware variants exist:
 - **LittleFS** for persistent config
 
 ### ESP32 (versi 5V)
-- **FPM10A sensor** via HardwareSerial2 (RX=GPIO16, TX=GPIO17)
-- **ILI9341 TFT LCD** via SPI (CS=GPIO5, DC=GPIO2, RST=GPIO4, BL=GPIO15, SCK=GPIO18, MOSI=GPIO23)
-- **Web UI** (same tabs) + Select2 dropdown search for branch/employee
-- **LittleFS** for persistent config
-- **NTP time** for attendance timestamps
+- **FPM10A 5V** via HardwareSerial2 (RX=GPIO16, TX=GPIO17) — VCC → VIN 5V, GND → GND
+- **Touch gate** sama 3V3: `UA` (T-3V3) → 3V3, `TCH` (T-OUT) → GPIO13 (`TOUCH_PIN`) — UA wajib 3.3V
+- **ILI9341 TFT LCD** via SPI (CS=GPIO5, DC=GPIO2, RST=GPIO4, BL=GPIO15, SCK=GPIO18, MOSI=GPIO23); VCC LCD → VIN 5V
+- **BLE-first** sama 3V3 (UUID GATT identik) — nama advertising **`PJTKI-Finger-5V`** (3V3 tetap `PJTKI-Finger`). App filter `contains(PJTKI-Finger)` tetap menemukan keduanya
+- **LittleFS** via `#include <LittleFS.h>` pada partisi `littlefs` (sketch-local `partitions.csv`, `no_ota_lfs`)
+- **NTP time** untuk timestamp absensi
+- Parameter sensor 5V (baud 9600-first, security **2**, `FINGER_CONFIRM_NEEDED=1`) — lihat tabel di bawah
 
 ### ESP32 (versi 3V3)
 - **FPM10A 3.3V** via HardwareSerial2 (RX=GPIO16/RX2, TX=GPIO17/TX2)
@@ -36,12 +38,12 @@ arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 /home/gugus/Documents/Proje
 arduino-cli upload --fqbn esp8266:esp8266:nodemcuv2 --port /dev/ttyACM0 /home/gugus/Documents/Project/pjtki/arduino/nodemcu_bridge/nodemcu_bridge.ino
 ```
 
-### ESP32
+### ESP32 (versi 5V)
 ```bash
-# Compile (versi 5V)
-arduino-cli compile --fqbn esp32:esp32:esp32 /home/gugus/Documents/Project/pjtki/arduino/esp32-fpm10a-versi-5v/esp32-fpm10a-versi-5v.ino
+# Compile (partisi sama 3V3 — sketch BLE besar, wajib no_ota_lfs)
+arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=no_ota_lfs /home/gugus/Documents/Project/pjtki/arduino/esp32-fpm10a-versi-5v/esp32-fpm10a-versi-5v.ino
 # Upload (serial port /dev/ttyUSB0)
-arduino-cli upload --fqbn esp32:esp32:esp32 --port /dev/ttyUSB0 /home/gugus/Documents/Project/pjtki/arduino/esp32-fpm10a-versi-5v/esp32-fpm10a-versi-5v.ino
+arduino-cli upload --fqbn esp32:esp32:esp32:PartitionScheme=no_ota_lfs --port /dev/ttyUSB0 /home/gugus/Documents/Project/pjtki/arduino/esp32-fpm10a-versi-5v/esp32-fpm10a-versi-5v.ino
 ```
 
 ### ESP32 (versi 3V3)
@@ -88,7 +90,7 @@ case SCAN_IDLE:
 
 **How it works**:
 1. Each `getImage()` returning OK increments `fingerConfirm`
-2. Need `FINGER_CONFIRM_NEEDED` consecutive OK reads before processing (3V3 = **1**, 5V = **2**)
+2. Need `FINGER_CONFIRM_NEEDED` consecutive OK reads before processing (**5V & 3V3 = 1** — 5V dulu 2, sekarang 1 untuk respons cepat)
 3. Between confirmations (jika N>1): cooldown `+30ms`
 4. Any NOFINGER or error resets the counter to 0
 5. Counter also reset after scan completes (WAIT_RELEASE → IDLE)
@@ -110,7 +112,7 @@ case SCAN_IDLE:
 
 Perilaku & proteksi:
 - Polaritas (active-high vs active-low) di-detect **otomatis saat boot** (`irCalibrate()` — sampling 20×25ms, **jangan sentuh sensor selama kalibrasi**). Dipanggil di **akhir** setup setelah deteksi sensor (~20s) supaya TTP233D sudah stabil
-- `irUpdateGate()`: debounce — butuh `IR_CONFIRM_MS` (100ms) deteksi kontinu untuk BUKA gate, `IR_RELEASE_MS` (400ms) kosong untuk TUTUP
+- `irUpdateGate()`: debounce — butuh `IR_CONFIRM_MS` deteksi kontinu untuk BUKA gate, `IR_RELEASE_MS` kosong untuk TUTUP (**5V: 15/200ms**, **3V3: 100/400ms** — jangan samakan)
 - `IR_GATE_TIMEOUT_MS` (3s): gate terbuka lama tanpa hasil → tutup sementara (putus feedback LED FPM10A), `IR_GATE_COOLDOWN_MS` (2.5s) sebelum evaluasi ulang
 - `FALLBACK_POLL_MS` (1.5s): saat gate tutup, gunakan `getTemplateCount()` sebagai ping tanpa LED; hasil ping harus diperiksa
 - Saat gate false (standby) → `getImage()` di-skip total; `lastScanActivity` hanya diperbarui jika ping sensor berhasil
@@ -177,9 +179,16 @@ VCC LCD → VIN 5V ESP32        (bukan 3.3V — kurangi beban regulator)
 
 | Parameter | 5V | 3.3V | Reason |
 |---|---|---|---|
-| `FINGER_CONFIRM_NEEDED` | 2 | **1** | 3.3V touch sensor weaker, can't sustain 2x OK reads |
-| `scanCooldownUntil` (confirm spacing) | `+50ms` | **`+30ms`** | Current 3V3 firmware spacing |
-| `FINGERPRINT_SECURITY_LEVEL` | 3 | **2** | Less detailed images at 3.3V |
+| `IR_CONFIRM_MS` (gate buka) | **15** | 100 | 5V + LED pre-warm overlap debounce gate |
+| `IR_RELEASE_MS` (gate tutup) | **200** | 400 | 5V release lebih cepat tanpa flicker berlebihan |
+| `IR_GATE_TIMEOUT_MS` | **2000** | 3000 | 5V scan lebih cepat, timeout gate lebih pendek |
+| `IR_GATE_COOLDOWN_MS` | **800** | 2500 | Recovery setelah gate timeout — 3V3 butuh jeda lebih lama |
+| `FALLBACK_POLL_MS` | **2500** | 1500 | 5V gate lebih andal → ping idle lebih jarang |
+| `LED_WARMUP_MS` | **30** | 120 | 5V pre-warm LED saat touch → scan lebih cepat |
+| Loop `delay()` autoscan | **15** | 40 | Poll gate ~50 Hz (5V) vs ~20 Hz (3V3) |
+| `FINGER_CONFIRM_NEEDED` | **1** | **1** | 5V respons cepat; 3V3 sensor lemah sama 1x OK |
+| `FINGERPRINT_SECURITY_LEVEL` | **2** | **2** | 5V/3V3 scan cepat; naik ke 3 jika false match |
+| GPIO13 TCH | **INPUT** | INPUT_PULLUP | 5V TCH push-pull — tanpa pull-up internal |
 | `SCAN_WATCHDOG_MS` | 15000 | **20000** | 3.3V sensor slower, more timeout tolerance |
 | `MAX_CONSECUTIVE_ERRORS` | 5 | **8** | 3.3V more transient errors, don't restart too quickly |
 | Error throttle `delay()` | 200ms | **300ms** | Give more breathing room |

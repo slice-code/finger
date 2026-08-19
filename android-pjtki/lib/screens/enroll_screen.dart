@@ -4,6 +4,8 @@ import 'package:provider/provider.dart';
 
 import '../models/models.dart';
 import '../services/ble_service.dart';
+import '../services/enroll_store.dart';
+import '../theme/app_theme.dart';
 
 class EnrollScreen extends StatefulWidget {
   final Employee employee;
@@ -35,14 +37,23 @@ class _EnrollScreenState extends State<EnrollScreen> {
   void initState() {
     super.initState();
     _sub = context.read<BleService>().eventStream.listen(_onEvent);
-    _sendEnroll();
+    _startEnroll();
+  }
+
+  /// Simpan nama + employeeId di storage Android dulu, baru kirim ke ESP32.
+  Future<void> _startEnroll() async {
+    final store = context.read<EnrollStore>();
+    await store.savePending(widget.employee.id, widget.employee.nama);
+    await _sendEnroll();
   }
 
   Future<void> _sendEnroll() async {
     try {
+      await context.read<EnrollStore>().markEnrolling(widget.employee.id);
       await context.read<BleService>().enroll(widget.employee.id, widget.employee.nama);
       _armTimeout();
     } catch (e) {
+      await context.read<EnrollStore>().markFailed(widget.employee.id);
       _fail('Gagal mengirim perintah: ${e.toString().replaceAll('Exception: ', '')}');
     }
   }
@@ -52,6 +63,7 @@ class _EnrollScreenState extends State<EnrollScreen> {
     // ESP menunggu hingga ~3 menit per tahap — timeout app sedikit lebih longgar.
     _timeout = Timer(const Duration(minutes: 4), () {
       if (!_done && !_error) {
+        unawaited(context.read<EnrollStore>().markFailed(widget.employee.id));
         setState(() {
           _error = true;
           _statusText = 'Timeout — tidak ada aktivitas sensor';
@@ -113,16 +125,17 @@ class _EnrollScreenState extends State<EnrollScreen> {
           _error = true;
           _cancelling = false;
           _statusText = 'Sidik jari sudah terdaftar (ID ${ev.data['id'] ?? '?'})';
+          unawaited(context.read<EnrollStore>().markFailed(widget.employee.id));
           break;
         case 'enrolled':
           _done = true;
           _cancelling = false;
-          _progress = 100;
-          _statusText = 'Berhasil terdaftar (ID ${ev.data['id'] ?? '?'})';
+          _progress = 95;
+          final hasHex = ev.data['hex'] == true;
+          final fingerId = (ev.data['id'] as num?)?.toInt() ?? 0;
+          _statusText = 'Menyimpan template ke HP...';
           _timeout?.cancel();
-          Timer(const Duration(seconds: 2), () {
-            if (mounted) Navigator.of(context).pop(true);
-          });
+          unawaited(_finishEnrolled(fingerId, hexReady: hasHex));
           break;
         case 'enroll_cancelled':
           _error = true;
@@ -140,24 +153,112 @@ class _EnrollScreenState extends State<EnrollScreen> {
           final reason = ev.data['reason']?.toString();
           final code = ev.data['code'];
           _cancelling = false;
+          unawaited(context.read<EnrollStore>().markFailed(widget.employee.id));
           _fail(reason != null && reason.isNotEmpty
               ? 'Enroll gagal: $reason${code != null ? ' ($code)' : ''}'
               : 'Enroll gagal (code ${code ?? '?'})');
           break;
         case 'register_server':
-          if (ev.data['ok'] == true) {
-            _statusText = 'Berhasil terdaftar + tersinkron ke server';
-          }
           break;
       }
     });
   }
 
   void _fail(String msg) {
+    unawaited(context.read<EnrollStore>().markFailed(widget.employee.id));
     setState(() {
       _error = true;
       _statusText = msg;
     });
+  }
+
+  Future<void> _finishEnrolled(int fingerId, {required bool hexReady}) async {
+    await _onEnrolled(fingerId, hexReady: hexReady);
+    if (!mounted) return;
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    if (mounted) Navigator.of(context).pop(true);
+  }
+
+  /// Hex dari ESP32 sudah di-push ke characteristic — baca langsung, simpan di HP.
+  /// GET_TEMPLATE hanya fallback (lambat: UART sensor).
+  Future<void> _onEnrolled(int fingerId, {required bool hexReady}) async {
+    final store = context.read<EnrollStore>();
+    final ble = context.read<BleService>();
+    String hex = '';
+    if (fingerId > 0) {
+      try {
+        hex = await ble.readPushedEnrollHex() ?? '';
+        if (hex.length != 512 && hexReady) {
+          final tpl = await ble.readEnrollTemplate(fingerId);
+          hex = tpl?['hex']?.toString() ?? '';
+        }
+      } catch (e) {
+        debugPrint('[ENROLL] fetch hex failed: $e');
+      }
+    }
+    await store.markEnrolled(
+      widget.employee.id,
+      fingerId,
+      hex: hex.length == 512 ? hex : null,
+    );
+    if (!mounted) return;
+    setState(() {
+      _progress = 100;
+      _statusText = hex.length == 512
+          ? 'Berhasil (ID $fingerId) — hex tersimpan di HP'
+          : 'Terdaftar (ID $fingerId) — hex belum lengkap di HP';
+    });
+    debugPrint('[ENROLL] local saved id=$fingerId hex=${hex.length}');
+  }
+
+  String _hintText() {
+    if (_done || _error) return '';
+    if (_step < 2) {
+      return 'Tekan pelan satu jari di kaca sensor.\nLampu dan LCD menyala sampai 2 kali scan selesai.';
+    }
+    if (_step == 2) return 'Angkat jari, lalu tempel lagi di posisi yang sama.';
+    if (_step == 4) return 'Tahan jari — jangan diangkat sampai selesai.';
+    return '';
+  }
+
+  Widget _stepRow() {
+    const labels = ['Siap', 'Scan 1', 'Angkat', 'Scan 2', 'Simpan'];
+    return Row(
+      children: [
+        for (var i = 0; i < labels.length; i++) ...[
+          if (i > 0)
+            Expanded(
+              child: Container(
+                height: 2,
+                color: (_done || _step > i)
+                    ? AppTheme.success
+                    : Theme.of(context).dividerColor,
+              ),
+            ),
+          Column(
+            children: [
+              CircleAvatar(
+                radius: 14,
+                backgroundColor: (_done || _step >= i)
+                    ? (_error && !_done
+                        ? AppTheme.danger
+                        : Theme.of(context).colorScheme.primary)
+                    : Theme.of(context).colorScheme.surfaceContainerHighest,
+                foregroundColor: (_done || _step >= i)
+                    ? Colors.white
+                    : Theme.of(context).colorScheme.onSurfaceVariant,
+                child: Text('${i + 1}',
+                    style: const TextStyle(
+                        fontSize: 12, fontWeight: FontWeight.w800)),
+              ),
+              const SizedBox(height: 4),
+              Text(labels[i],
+                  style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w600)),
+            ],
+          ),
+        ],
+      ],
+    );
   }
 
   Future<void> _cancel() async {
@@ -207,62 +308,69 @@ class _EnrollScreenState extends State<EnrollScreen> {
           automaticallyImplyLeading: !busy,
         ),
         body: Padding(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Card(
                 child: ListTile(
-                  leading: const Icon(Icons.person, size: 36, color: Color(0xFF1E88E5)),
+                  leading: PersonAvatar(name: emp.nama),
                   title: Text(emp.nama,
-                      style: const TextStyle(fontWeight: FontWeight.bold)),
+                      style: const TextStyle(fontWeight: FontWeight.w800)),
                   subtitle: Text(emp.id),
                 ),
               ),
-              const SizedBox(height: 32),
+              const SizedBox(height: 28),
+              _stepRow(),
+              const SizedBox(height: 28),
               Icon(
                 _done
-                    ? Icons.check_circle
+                    ? Icons.check_circle_rounded
                     : _error
-                        ? Icons.error
+                        ? Icons.error_outline
                         : Icons.fingerprint,
-                size: 80,
+                size: 92,
                 color: _done
-                    ? Colors.green
+                    ? AppTheme.success
                     : _error
-                        ? Colors.red
-                        : const Color(0xFF1E88E5),
+                        ? AppTheme.danger
+                        : Theme.of(context).colorScheme.primary,
               ),
               const SizedBox(height: 16),
               Text(
                 _statusText,
                 textAlign: TextAlign.center,
                 style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                  color: _error ? Colors.red : null,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                  height: 1.3,
+                  color: _error ? AppTheme.danger : null,
                 ),
               ),
-              const SizedBox(height: 24),
-              LinearProgressIndicator(value: _progress / 100, minHeight: 8),
-              const SizedBox(height: 12),
+              const SizedBox(height: 20),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: LinearProgressIndicator(
+                  value: _progress / 100,
+                  minHeight: 10,
+                ),
+              ),
+              const SizedBox(height: 14),
               Text(
-                _step < 2 && !_done && !_error
-                    ? 'Letakkan satu jari pada sensor FPM10A, tekan pelan.\nLampu sensor & LCD tetap menyala sampai 2x scan selesai.'
-                    : _step == 2 && !_done && !_error
-                        ? 'Angkat jari, lalu tempel lagi di posisi yang sama.'
-                        : _step == 4 && !_done && !_error
-                            ? 'Tahan jari — jangan diangkat sampai selesai.'
-                            : '',
+                _hintText(),
                 textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.grey, fontSize: 13),
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  fontSize: 14,
+                  height: 1.4,
+                ),
               ),
               const Spacer(),
               if (busy)
                 FilledButton.icon(
                   onPressed: _cancelling ? null : _cancel,
                   style: FilledButton.styleFrom(
-                    backgroundColor: Colors.red.shade600,
+                    backgroundColor: AppTheme.danger,
                     foregroundColor: Colors.white,
                   ),
                   icon: _cancelling
@@ -274,13 +382,13 @@ class _EnrollScreenState extends State<EnrollScreen> {
                             color: Colors.white,
                           ),
                         )
-                      : const Icon(Icons.cancel),
-                  label: Text(_cancelling ? 'Membatalkan...' : 'Batalkan Enroll'),
+                      : const Icon(Icons.close),
+                  label: Text(_cancelling ? 'Membatalkan…' : 'Batalkan'),
                 )
               else
                 FilledButton.tonal(
                   onPressed: () => Navigator.of(context).pop(_done),
-                  child: const Text('Tutup'),
+                  child: const Text('Selesai'),
                 ),
             ],
           ),

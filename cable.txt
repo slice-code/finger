@@ -47,3 +47,30 @@ Tidak pakai pinMode(OUTPUT) — ledcAttach sudah menangani.
   (0x50/0x51) — mati saat idle, nyala 100ms sebelum getImage
 - CPU ESP32: 80MHz (setCpuFrequencyMhz)
 - TX Power WiFi: 11dBm (WiFi.setTxPower)
+
+=====================================
+WIRING — ESP32 FPM10A 5V Version
+(firmware BLE = versi 3V3, hardware 5V)
+=====================================
+
+=== ESP32 ↔ FPM10A Finger Sensor 5V ===
+RX2 (GPIO16) → FPM10A TX
+TX2 (GPIO17) → FPM10A RX
+VIN 5V        → FPM10A VCC
+GND           → FPM10A GND
+--- Touch Gate (TCH + UA, keduanya wajib) ---
+3V3           → FPM10A UA   (T-3V3 / daya IC sentuh — JANGAN 5V)
+GPIO13        → FPM10A TCH  (T-OUT / sinyal jari)
+
+=== ESP32 ↔ ILI9341 TFT LCD SPI ===
+GPIO5  → CS
+GPIO2  → DC
+GPIO4  → RST
+GPIO18 → SCK
+GPIO23 → MOSI
+VIN 5V → VCC
+GND    → GND
+GPIO15 → LED (backlight)
+
+App Android: device name **PJTKI-Finger-5V** (3V3: PJTKI-Finger), UUID sama.
+

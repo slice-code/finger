@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 import '../models/models.dart';
 import '../services/api_service.dart';
 import '../services/ble_service.dart';
+import '../theme/app_theme.dart';
 
 class RiwayatScreen extends StatefulWidget {
   const RiwayatScreen({super.key});
@@ -124,19 +125,19 @@ class _RiwayatScreenState extends State<RiwayatScreen> {
   Color _statusColor(String s) {
     switch (s) {
       case 'hadir':
-        return Colors.green;
+        return AppTheme.success;
       case 'terlambat':
-        return Colors.orange;
+        return AppTheme.warning;
       case 'izin':
-        return Colors.blue;
+        return Theme.of(context).colorScheme.primary;
       case 'alpha':
-        return Colors.red;
+        return AppTheme.danger;
       case 'pulang_cepat':
         return Colors.deepOrange;
       case 'pending':
-        return Colors.purple;
+        return const Color(0xFF6A1B9A);
       default:
-        return Colors.grey;
+        return Theme.of(context).colorScheme.outline;
     }
   }
 
@@ -253,13 +254,20 @@ class _RiwayatScreenState extends State<RiwayatScreen> {
                           ),
                         )
                       : merged.isEmpty
-                          ? const Center(child: Text('Belum ada data absensi'))
+                          ? const AppEmptyState(
+                              icon: Icons.event_busy_outlined,
+                              title: 'Belum ada absensi',
+                              subtitle:
+                                  'Riwayat tampil di sini setelah karyawan menempelkan jari.',
+                            )
                           : RefreshIndicator(
                               onRefresh: _reload,
                               child: ListView.separated(
                                 controller: _pageController,
+                                padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
                                 itemCount: merged.length + (_hasMore ? 1 : 0),
-                                separatorBuilder: (_, _) => const Divider(height: 1),
+                                separatorBuilder: (_, _) =>
+                                    const SizedBox(height: 8),
                                 itemBuilder: (context, i) {
                                   if (i >= merged.length) {
                                     return const Padding(
@@ -271,50 +279,49 @@ class _RiwayatScreenState extends State<RiwayatScreen> {
                                   }
                                   final r = merged[i];
                                   final isLocal = !r.synced;
-                                  return ListTile(
-                                    leading: CircleAvatar(
-                                      backgroundColor: _statusColor(r.status)
-                                          .withValues(alpha: 0.15),
-                                      child: Icon(
-                                        isLocal
-                                            ? Icons.bluetooth
-                                            : Icons.badge_outlined,
+                                  return Card(
+                                    child: ListTile(
+                                      contentPadding:
+                                          const EdgeInsets.symmetric(
+                                              horizontal: 14, vertical: 6),
+                                      leading: PersonAvatar(
+                                        name: r.nama,
                                         color: _statusColor(r.status),
-                                        size: 20,
                                       ),
-                                    ),
-                                    title: Text(
-                                      r.nama,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                    subtitle: Text([
-                                      if (r.idBiodata != null) r.idBiodata!,
-                                      if (r.tanggal.isNotEmpty) r.tanggal,
-                                      if (isLocal) 'lokal (belum sync)',
-                                    ].join(' • ')),
-                                    trailing: Column(
-                                      mainAxisAlignment: MainAxisAlignment.center,
-                                      crossAxisAlignment: CrossAxisAlignment.end,
-                                      children: [
-                                        Chip(
-                                          label: Text(r.status.toUpperCase()),
-                                          backgroundColor: _statusColor(r.status),
-                                          labelStyle: const TextStyle(
-                                            color: Colors.white,
-                                            fontSize: 10,
+                                      title: Text(
+                                        r.nama,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                            fontWeight: FontWeight.w700),
+                                      ),
+                                      subtitle: Text([
+                                        if (r.idBiodata != null) r.idBiodata!,
+                                        if (r.tanggal.isNotEmpty) r.tanggal,
+                                        if (isLocal) 'belum ke server',
+                                      ].join(' • ')),
+                                      trailing: Column(
+                                        mainAxisAlignment:
+                                            MainAxisAlignment.center,
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.end,
+                                        children: [
+                                          StatusBadge(
+                                            label: r.status,
+                                            color: _statusColor(r.status),
                                           ),
-                                          visualDensity: VisualDensity.compact,
-                                        ),
-                                        const SizedBox(height: 2),
-                                        Text(
-                                          'M: ${r.jamMasuk ?? "--"}  P: ${r.jamPulang ?? "--"}',
-                                          style: const TextStyle(
-                                            fontSize: 11,
-                                            color: Colors.grey,
+                                          const SizedBox(height: 4),
+                                          Text(
+                                            'M ${r.jamMasuk ?? "--"}  P ${r.jamPulang ?? "--"}',
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              color: Theme.of(context)
+                                                  .colorScheme
+                                                  .onSurfaceVariant,
+                                            ),
                                           ),
-                                        ),
-                                      ],
+                                        ],
+                                      ),
                                     ),
                                   );
                                 },

@@ -1,11 +1,16 @@
 import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../models/models.dart';
+import '../services/api_service.dart';
 import '../services/ble_service.dart';
 import '../services/settings_store.dart';
+import '../theme/app_theme.dart';
 import 'connect_screen.dart';
+import 'device_scan_screen.dart';
 
 class WifiApInfo {
   final String ssid;
@@ -24,14 +29,21 @@ class SetelanScreen extends StatefulWidget {
 class _SetelanScreenState extends State<SetelanScreen> {
   final _appApiUrl = TextEditingController();
   final _deviceApiUrl = TextEditingController();
-  final _kodeCabang = TextEditingController();
   final _deviceId = TextEditingController();
   final _apiKey = TextEditingController();
   final _wifiSsid = TextEditingController();
   final _wifiPass = TextEditingController();
-  final _uploadInterval = TextEditingController(text: '120');
+
+  List<Branch> _branches = [];
+  String? _kodeCabang;
+  bool _loadingBranches = false;
+
+  int _uploadInterval = 120;
+  static const _intervalChoices = <int>[5, 15, 30, 60, 120, 240, 360, 720, 1440];
+
   bool _irEnabled = true;
-  bool _apEnabled = false;
+  bool _obscureKey = true;
+  bool _obscureWifi = true;
   bool _loading = false;
   bool _wifiScanning = false;
   String _statusMsg = '';
@@ -44,11 +56,37 @@ class _SetelanScreenState extends State<SetelanScreen> {
     final settings = context.read<SettingsStore>();
     _appApiUrl.text = settings.apiBaseUrl;
     _deviceApiUrl.text = settings.apiBaseUrl;
-    _kodeCabang.text = settings.kodeCabang;
+    _kodeCabang = settings.kodeCabang.isEmpty ? null : settings.kodeCabang;
     _deviceId.text = settings.deviceId;
     _apiKey.text = settings.apiKey;
     _bleSub = context.read<BleService>().eventStream.listen(_onBleEvent);
+    _loadBranches();
     _loadDeviceSettings();
+  }
+
+  Future<void> _loadBranches() async {
+    setState(() => _loadingBranches = true);
+    try {
+      final list = await context.read<ApiService>().fetchBranches();
+      if (!mounted) return;
+      setState(() {
+        _branches = list;
+        // Pastikan value dropdown valid.
+        if (_kodeCabang != null &&
+            _kodeCabang!.isNotEmpty &&
+            !_branches.any((b) => b.kode == _kodeCabang)) {
+          // kode lama tidak ada di list — tetap tampilkan sebagai opsi sementara
+          _branches = [
+            Branch(kode: _kodeCabang!, nama: _kodeCabang!, kota: ''),
+            ..._branches,
+          ];
+        }
+      });
+    } catch (_) {
+      // Biarkan dropdown kosong; user masih bisa pilih device BLK.
+    } finally {
+      if (mounted) setState(() => _loadingBranches = false);
+    }
   }
 
   void _onBleEvent(BleEvent ev) {
@@ -66,16 +104,14 @@ class _SetelanScreenState extends State<SetelanScreen> {
       case 'wifi_connected':
         final ssid = ev.data['ssid']?.toString() ?? '';
         final ip = ev.data['ip']?.toString() ?? '';
-        setState(() => _statusMsg = 'WiFi terhubung: $ssid ($ip) ✓');
+        setState(() => _statusMsg = 'WiFi terhubung: $ssid ($ip)');
         context.read<BleService>().readStatus();
         break;
       case 'wifi_failed':
-        setState(() {
-          _statusMsg = 'WiFi gagal connect — cek SSID/password ✗';
-        });
+        setState(() => _statusMsg = 'WiFi gagal connect — cek SSID/password');
         break;
       case 'settings_saved':
-        setState(() => _statusMsg = 'Pengaturan device disimpan ✓');
+        setState(() => _statusMsg = 'Pengaturan device disimpan');
         break;
       case 'settings_fail':
         setState(() {
@@ -87,7 +123,7 @@ class _SetelanScreenState extends State<SetelanScreen> {
         if (st == 'scanning' || st == 'queued') {
           setState(() {
             _wifiScanning = true;
-            _statusMsg = 'ESP32 sedang scan WiFi (bisa 20–40 detik)...';
+            _statusMsg = 'ESP32 sedang scan WiFi...';
           });
         } else if (st == 'busy') {
           setState(() {
@@ -126,12 +162,10 @@ class _SetelanScreenState extends State<SetelanScreen> {
     _bleSub?.cancel();
     _appApiUrl.dispose();
     _deviceApiUrl.dispose();
-    _kodeCabang.dispose();
     _deviceId.dispose();
     _apiKey.dispose();
     _wifiSsid.dispose();
     _wifiPass.dispose();
-    _uploadInterval.dispose();
     super.dispose();
   }
 
@@ -144,25 +178,35 @@ class _SetelanScreenState extends State<SetelanScreen> {
       if (s['apiBaseUrl'] != null) {
         _deviceApiUrl.text = s['apiBaseUrl'].toString();
       }
-      if (s['kodeCabang'] != null) _kodeCabang.text = s['kodeCabang'].toString();
+      if (s['kodeCabang'] != null) {
+        final kode = s['kodeCabang'].toString();
+        _kodeCabang = kode.isEmpty ? null : kode;
+        if (_kodeCabang != null &&
+            !_branches.any((b) => b.kode == _kodeCabang)) {
+          _branches = [
+            Branch(kode: _kodeCabang!, nama: _kodeCabang!, kota: ''),
+            ..._branches,
+          ];
+        }
+      }
       if (s['deviceId'] != null) _deviceId.text = s['deviceId'].toString();
       if (s['apiKey'] != null) _apiKey.text = s['apiKey'].toString();
       if (s['wifiSsid'] != null) _wifiSsid.text = s['wifiSsid'].toString();
       if (s['irEnabled'] != null) _irEnabled = s['irEnabled'] == true;
-      if (s['apEnabled'] != null) _apEnabled = s['apEnabled'] == true;
       if (s['uploadIntervalMinutes'] != null) {
-        final minutes = int.tryParse(s['uploadIntervalMinutes'].toString()) ?? 120;
-        _uploadInterval.text = minutes.toString();
+        final minutes =
+            int.tryParse(s['uploadIntervalMinutes'].toString()) ?? 120;
+        _uploadInterval = minutes.clamp(5, 1440);
       }
     });
   }
 
   Future<void> _saveAppApi() async {
-    final settings = context.read<SettingsStore>();
     final url = _appApiUrl.text.trim();
     if (url.isEmpty) return;
-    settings.apiBaseUrl = url;
-    setState(() => _statusMsg = 'URL API app (HP) disimpan ✓');
+    context.read<SettingsStore>().apiBaseUrl = url;
+    setState(() => _statusMsg = 'URL API app disimpan');
+    await _loadBranches();
   }
 
   Future<void> _copyDeviceUrlToApp() async {
@@ -176,11 +220,10 @@ class _SetelanScreenState extends State<SetelanScreen> {
       _statusMsg = '';
     });
     final settings = context.read<SettingsStore>();
-    // App API tetap dari field app — jangan ditimpa field device.
     if (_appApiUrl.text.trim().isNotEmpty) {
       settings.apiBaseUrl = _appApiUrl.text.trim();
     }
-    settings.kodeCabang = _kodeCabang.text.trim();
+    settings.kodeCabang = _kodeCabang ?? '';
     settings.deviceId = _deviceId.text.trim();
     settings.apiKey = _apiKey.text.trim();
 
@@ -195,27 +238,151 @@ class _SetelanScreenState extends State<SetelanScreen> {
           _deviceApiUrl.text = deviceUrl;
           httpsRewritten = true;
         }
-        final intervalMinutes = int.tryParse(_uploadInterval.text.trim()) ?? 120;
+        final interval = _uploadInterval.clamp(5, 1440);
         await ble.writeSettings({
           'apiBaseUrl': deviceUrl,
-          'kodeCabang': _kodeCabang.text.trim(),
+          'kodeCabang': _kodeCabang ?? '',
           'deviceId': _deviceId.text.trim(),
           'apiKey': _apiKey.text.trim(),
           'irEnabled': _irEnabled,
-          'apEnabled': _apEnabled,
-          'uploadIntervalMinutes': intervalMinutes.clamp(5, 1440),
+          'uploadIntervalMinutes': interval,
         });
-        await ble.setUploadInterval(intervalMinutes.clamp(5, 1440));
+        await ble.setUploadInterval(interval);
         setState(() {
           _statusMsg = httpsRewritten
-              ? 'Tersimpan sebagai HTTP (HTTPS tidak stabil di ESP32): $deviceUrl'
-              : 'Pengaturan disimpan ✓';
+              ? 'Tersimpan sebagai HTTP: $deviceUrl'
+              : 'Pengaturan disimpan';
         });
       } else {
-        setState(() => _statusMsg = 'Pengaturan app disimpan ✓');
+        setState(() => _statusMsg = 'Pengaturan app disimpan (device belum konek)');
       }
     } catch (e) {
-      setState(() => _statusMsg = 'Gagal: ${e.toString().replaceAll('Exception: ', '')}');
+      setState(() =>
+          _statusMsg = 'Gagal: ${e.toString().replaceAll('Exception: ', '')}');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _loginAndPickDevice() async {
+    final settings = context.read<SettingsStore>();
+    final api = context.read<ApiService>();
+    if (!settings.isLoggedIn) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Login user BLK dulu')),
+      );
+      return;
+    }
+    setState(() {
+      _loading = true;
+      _statusMsg = 'Mengambil daftar device...';
+    });
+    try {
+      final devices = await api.fetchDevices();
+      if (!mounted) return;
+      if (devices.isEmpty) {
+        setState(() => _statusMsg = 'Tidak ada device key di BLK');
+        return;
+      }
+      final selected = await showModalBottomSheet<Map<String, dynamic>>(
+        context: context,
+        showDragHandle: true,
+        builder: (ctx) => SafeArea(
+          child: ListView(
+            shrinkWrap: true,
+            children: [
+              const Padding(
+                padding: EdgeInsets.fromLTRB(16, 8, 16, 8),
+                child: Text('Pilih Device BLK',
+                    style:
+                        TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+              ),
+              for (final d in devices)
+                ListTile(
+                  leading: const Icon(Icons.devices, color: Color(0xFF1E88E5)),
+                  title: Text(
+                      '${d['kode_cabang']}${(d['device_id']?.toString() ?? '').isNotEmpty ? ' — ${d['device_id']}' : ''}'),
+                  subtitle: Text(
+                      'Masuk ${d['batas_masuk'] ?? '08:00'} · Pulang ${d['batas_pulang'] ?? '16:00'}'),
+                  onTap: () => Navigator.pop(ctx, d),
+                ),
+            ],
+          ),
+        ),
+      );
+      if (selected == null) {
+        setState(() => _statusMsg = '');
+        return;
+      }
+      settings.apiKey = selected['device_key']?.toString() ?? '';
+      settings.kodeCabang = selected['kode_cabang']?.toString() ?? '';
+      settings.deviceId = selected['device_id']?.toString() ?? '';
+      _apiKey.text = settings.apiKey;
+      _kodeCabang =
+          settings.kodeCabang.isEmpty ? null : settings.kodeCabang;
+      _deviceId.text = settings.deviceId;
+      if (_kodeCabang != null &&
+          !_branches.any((b) => b.kode == _kodeCabang)) {
+        _branches = [
+          Branch(kode: _kodeCabang!, nama: _kodeCabang!, kota: ''),
+          ..._branches,
+        ];
+      }
+      setState(() {
+        _statusMsg =
+            'Device dipilih: ${settings.kodeCabang}. Tekan Simpan untuk kirim ke ESP32.';
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() => _statusMsg =
+            'Gagal ambil device: ${e.toString().replaceAll('Exception: ', '')}');
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _cleanFingers() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Bersihkan Fingerprint'),
+        content: const Text(
+            'Hapus SEMUA sidik jari di sensor ESP32 + data json lokal?\n\n'
+            'Gunakan sebelum sinkron ulang dari server.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Batal')),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('Bersihkan'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    final ble = context.read<BleService>();
+    setState(() {
+      _loading = true;
+      _statusMsg = 'Membersihkan fingerprint ESP32...';
+    });
+    try {
+      if (!ble.isConnected) {
+        setState(() => _statusMsg = 'Hubungkan device ESP32 dulu');
+        return;
+      }
+      await ble.cleanFingers();
+      await Future<void>.delayed(const Duration(milliseconds: 1200));
+      if (!mounted) return;
+      setState(() => _statusMsg = 'Fingerprint ESP32 dibersihkan');
+    } catch (e) {
+      if (mounted) {
+        setState(() => _statusMsg =
+            'Gagal: ${e.toString().replaceAll('Exception: ', '')}');
+      }
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -240,7 +407,8 @@ class _SetelanScreenState extends State<SetelanScreen> {
       if (mounted) {
         setState(() {
           _wifiScanning = false;
-          _statusMsg = 'Gagal scan: ${e.toString().replaceAll('Exception: ', '')}';
+          _statusMsg =
+              'Gagal scan: ${e.toString().replaceAll('Exception: ', '')}';
         });
       }
     }
@@ -256,7 +424,7 @@ class _SetelanScreenState extends State<SetelanScreen> {
     }
     if (_wifiSsid.text.trim().isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('SSID WiFi wajib diisi')),
+        const SnackBar(content: Text('Pilih / isi SSID WiFi dulu')),
       );
       return;
     }
@@ -270,15 +438,10 @@ class _SetelanScreenState extends State<SetelanScreen> {
       }
     } catch (e) {
       if (mounted) {
-        setState(() => _statusMsg = 'Gagal: ${e.toString().replaceAll('Exception: ', '')}');
+        setState(() => _statusMsg =
+            'Gagal: ${e.toString().replaceAll('Exception: ', '')}');
       }
     }
-  }
-
-  void _editConnection() {
-    Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const ConnectScreen()),
-    );
   }
 
   String _bars(int rssi) {
@@ -288,55 +451,212 @@ class _SetelanScreenState extends State<SetelanScreen> {
     return 'Lemah';
   }
 
+  String _intervalLabel(int minutes) {
+    if (minutes < 60) return '$minutes menit';
+    if (minutes == 60) return '1 jam';
+    if (minutes % 60 == 0) return '${minutes ~/ 60} jam';
+    return '$minutes menit';
+  }
+
+  InputDecoration _fieldDeco({
+    required String label,
+    String? helper,
+    Widget? prefix,
+    Widget? suffix,
+  }) {
+    return InputDecoration(
+      labelText: label,
+      helperText: helper,
+      prefixIcon: prefix,
+      suffixIcon: suffix,
+      border: const OutlineInputBorder(),
+      filled: true,
+      fillColor: Colors.grey.shade50,
+      isDense: true,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+    );
+  }
+
+  Widget _section({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required Widget child,
+    Color? accent,
+  }) {
+    final color = accent ?? const Color(0xFF1E88E5);
+    return Card(
+      elevation: 0,
+      color: Colors.white,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: BorderSide(color: Colors.grey.shade200),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 40,
+                  height: 40,
+                  decoration: BoxDecoration(
+                    color: color.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Icon(icon, color: color, size: 22),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(title,
+                          style: const TextStyle(
+                              fontWeight: FontWeight.w700, fontSize: 16)),
+                      const SizedBox(height: 2),
+                      Text(subtitle,
+                          style: TextStyle(
+                              color: Colors.grey.shade600, fontSize: 12)),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            child,
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final ble = context.watch<BleService>();
+    final connected = ble.isConnected;
+    final intervalValues = {
+      ..._intervalChoices,
+      if (!_intervalChoices.contains(_uploadInterval)) _uploadInterval,
+    }.toList()
+      ..sort();
+
     return Scaffold(
+      backgroundColor: const Color(0xFFF5F7FA),
       appBar: AppBar(
         title: const Text('Setelan'),
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.transparent,
         actions: [
           IconButton(
-            icon: const Icon(Icons.dns),
-            tooltip: 'Ubah Koneksi Server App',
-            onPressed: _editConnection,
+            icon: const Icon(Icons.dns_outlined),
+            tooltip: 'Koneksi Server App',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const ConnectScreen()),
+              );
+            },
           ),
         ],
       ),
       body: ListView(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 28),
         children: [
-          _card(
+          // Status strip
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+            decoration: BoxDecoration(
+              color: connected
+                  ? const Color(0xFFE8F5E9)
+                  : const Color(0xFFFFF3E0),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  connected
+                      ? Icons.bluetooth_connected
+                      : Icons.bluetooth_disabled,
+                  color: connected ? Colors.green.shade700 : Colors.orange.shade800,
+                  size: 20,
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    connected
+                        ? '${ble.connectedName} — siap ubah setelan'
+                        : 'ESP32 belum konek — setelan app tetap bisa disimpan',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: connected
+                          ? Colors.green.shade800
+                          : Colors.orange.shade900,
+                    ),
+                  ),
+                ),
+                TextButton(
+                  onPressed: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                          builder: (_) => const DeviceScanScreen()),
+                    );
+                  },
+                  child: Text(connected ? 'Ganti' : 'Hubungkan'),
+                ),
+                if (connected)
+                  TextButton(
+                    onPressed: () async {
+                      if (!await confirmBleDisconnect(
+                          context, ble.connectedName)) {
+                        return;
+                      }
+                      await context
+                          .read<BleService>()
+                          .disconnect(forget: true);
+                    },
+                    style: TextButton.styleFrom(
+                        foregroundColor: AppTheme.danger),
+                    child: const Text('Lepas'),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+
+          // ── API App ──
+          _section(
+            icon: Icons.phone_android,
             title: 'API App (HP)',
-            subtitle:
-                'Dipakai app untuk daftar karyawan / riwayat. Bisa http:// atau https://cks.slice-code.com',
+            subtitle: 'Untuk daftar CPMI & riwayat di aplikasi',
             child: Column(
               children: [
                 TextField(
                   controller: _appApiUrl,
-                  decoration: const InputDecoration(
-                    labelText: 'API Base URL (app)',
-                    prefixIcon: Icon(Icons.phone_android),
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                    helperText: 'Contoh: https://cks.slice-code.com atau http://...',
+                  keyboardType: TextInputType.url,
+                  decoration: _fieldDeco(
+                    label: 'Base URL',
+                    helper: 'Contoh: http://192.168.1.15:3004',
+                    prefix: const Icon(Icons.link),
                   ),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 10),
                 Row(
                   children: [
                     Expanded(
                       child: FilledButton.tonalIcon(
                         onPressed: _saveAppApi,
-                        icon: const Icon(Icons.save),
-                        label: const Text('Simpan URL App'),
+                        icon: const Icon(Icons.save_outlined),
+                        label: const Text('Simpan'),
                       ),
                     ),
                     const SizedBox(width: 8),
                     Expanded(
                       child: OutlinedButton.icon(
-                        onPressed: ble.isConnected ? _copyDeviceUrlToApp : null,
-                        icon: const Icon(Icons.copy_all),
-                        label: const Text('Samakan dgn Device'),
+                        onPressed: connected ? _copyDeviceUrlToApp : null,
+                        icon: const Icon(Icons.copy_all_outlined),
+                        label: const Text('Dari device'),
                       ),
                     ),
                   ],
@@ -344,143 +664,194 @@ class _SetelanScreenState extends State<SetelanScreen> {
               ],
             ),
           ),
-          const SizedBox(height: 16),
-          _card(
-            title: 'Pengaturan Device (ESP32)',
-            subtitle: ble.isConnected
-                ? 'BLE terhubung — URL ini dipakai ESP untuk absensi/enroll'
-                : 'Hubungkan device untuk mengubah',
+          const SizedBox(height: 12),
+
+          // ── Device ESP32 ──
+          _section(
+            icon: Icons.memory,
+            title: 'Device ESP32',
+            subtitle: connected
+                ? 'Disimpan ke ESP32 via BLE'
+                : 'Hubungkan BLE untuk kirim ke device',
             child: Column(
               children: [
                 TextField(
                   controller: _deviceApiUrl,
-                  enabled: ble.isConnected,
-                  decoration: const InputDecoration(
-                    labelText: 'API Base URL (device)',
-                    prefixIcon: Icon(Icons.dns_outlined),
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                    helperText: 'Isi https:// juga boleh — otomatis jadi http:// di device',
+                  enabled: connected,
+                  keyboardType: TextInputType.url,
+                  decoration: _fieldDeco(
+                    label: 'API Base URL (device)',
+                    helper: 'https:// otomatis jadi http:// di ESP32',
+                    prefix: const Icon(Icons.dns_outlined),
                   ),
                 ),
                 const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: _kodeCabang,
-                        enabled: ble.isConnected,
-                        decoration: const InputDecoration(
-                          labelText: 'Kode Cabang',
-                          prefixIcon: Icon(Icons.business),
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: TextField(
-                        controller: _deviceId,
-                        enabled: ble.isConnected,
-                        decoration: const InputDecoration(
-                          labelText: 'Device ID',
-                          prefixIcon: Icon(Icons.devices),
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                        ),
-                      ),
-                    ),
-                  ],
+                DropdownButtonFormField<String>(
+                  // ignore: deprecated_member_use
+                  value: _kodeCabang,
+                  isExpanded: true,
+                  decoration: _fieldDeco(
+                    label: 'Cabang',
+                    prefix: const Icon(Icons.business_outlined),
+                    suffix: _loadingBranches
+                        ? const Padding(
+                            padding: EdgeInsets.all(12),
+                            child: SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          )
+                        : IconButton(
+                            tooltip: 'Muat ulang cabang',
+                            icon: const Icon(Icons.refresh, size: 20),
+                            onPressed: _loadingBranches ? null : _loadBranches,
+                          ),
+                  ),
+                  hint: const Text('Pilih cabang'),
+                  items: _branches
+                      .map((b) => DropdownMenuItem(
+                            value: b.kode,
+                            child: Text(
+                              b.kota.isEmpty ? b.label : '${b.nama} (${b.kode})',
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ))
+                      .toList(),
+                  onChanged: connected
+                      ? (v) => setState(() => _kodeCabang = v)
+                      : null,
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _deviceId,
+                  enabled: connected,
+                  decoration: _fieldDeco(
+                    label: 'Device ID',
+                    prefix: const Icon(Icons.devices_outlined),
+                  ),
                 ),
                 const SizedBox(height: 12),
                 TextField(
                   controller: _apiKey,
-                  enabled: ble.isConnected,
-                  obscureText: true,
-                  decoration: const InputDecoration(
-                    labelText: 'Device Key (X-Device-Key)',
-                    prefixIcon: Icon(Icons.key),
-                    border: OutlineInputBorder(),
-                    isDense: true,
+                  enabled: connected,
+                  obscureText: _obscureKey,
+                  decoration: _fieldDeco(
+                    label: 'Device Key',
+                    prefix: const Icon(Icons.key_outlined),
+                    suffix: IconButton(
+                      icon: Icon(
+                          _obscureKey ? Icons.visibility_off : Icons.visibility),
+                      onPressed: () =>
+                          setState(() => _obscureKey = !_obscureKey),
+                    ),
                   ),
                 ),
                 const SizedBox(height: 12),
-                TextField(
-                  controller: _uploadInterval,
-                  enabled: ble.isConnected,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    labelText: 'Jadwal upload otomatis (menit)',
-                    prefixIcon: Icon(Icons.schedule),
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                    helperText: 'Default 120 menit (2 jam).',
+                DropdownButtonFormField<int>(
+                  // ignore: deprecated_member_use
+                  value: _uploadInterval,
+                  isExpanded: true,
+                  decoration: _fieldDeco(
+                    label: 'Upload otomatis',
+                    helper: 'Kirim pending enroll/absensi ke server',
+                    prefix: const Icon(Icons.schedule_outlined),
                   ),
+                  items: intervalValues
+                      .map((m) => DropdownMenuItem(
+                            value: m,
+                            child: Text(_intervalLabel(m)),
+                          ))
+                      .toList(),
+                  onChanged: connected
+                      ? (v) {
+                          if (v != null) setState(() => _uploadInterval = v);
+                        }
+                      : null,
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 4),
                 SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
                   value: _irEnabled,
-                  onChanged: ble.isConnected
-                      ? (v) => setState(() => _irEnabled = v)
-                      : null,
-                  title: const Text('Gate IR / Touch presence'),
-                  subtitle: const Text('Sensor hanya dipoll saat ada jari'),
-                  contentPadding: EdgeInsets.zero,
-                ),
-                SwitchListTile(
-                  value: _apEnabled,
-                  onChanged: ble.isConnected
-                      ? (v) => setState(() => _apEnabled = v)
-                      : null,
-                  title: const Text('Mode SoftAP (FPM10A-Bridge)'),
-                  subtitle: const Text(
-                      'Default OFF — setup lewat BLE. ON hanya jika butuh web UI 192.168.4.1'),
-                  contentPadding: EdgeInsets.zero,
+                  onChanged:
+                      connected ? (v) => setState(() => _irEnabled = v) : null,
+                  title: const Text('Gate sentuh / IR'),
+                  subtitle: const Text('Sensor hanya aktif saat ada jari'),
                 ),
                 const SizedBox(height: 8),
                 Row(
                   children: [
                     Expanded(
                       child: FilledButton.tonalIcon(
-                        onPressed: ble.isConnected ? () async {
-                          try {
-                            await ble.syncNow();
-                            if (mounted) {
-                              setState(() => _statusMsg = 'Sync manual dikirim ke ESP32 ✓');
-                            }
-                          } catch (e) {
-                            if (mounted) {
-                              setState(() => _statusMsg = 'Gagal sync: ${e.toString().replaceAll('Exception: ', '')}');
-                            }
-                          }
-                        } : null,
+                        onPressed: connected
+                            ? () async {
+                                try {
+                                  await ble.syncNow();
+                                  if (mounted) {
+                                    setState(() =>
+                                        _statusMsg = 'Sync manual dikirim');
+                                  }
+                                } catch (e) {
+                                  if (mounted) {
+                                    setState(() => _statusMsg =
+                                        'Gagal sync: ${e.toString().replaceAll('Exception: ', '')}');
+                                  }
+                                }
+                              }
+                            : null,
                         icon: const Icon(Icons.sync),
-                        label: const Text('Sync Sekarang'),
+                        label: const Text('Sync sekarang'),
                       ),
                     ),
                     const SizedBox(width: 8),
                     Expanded(
                       child: FilledButton.icon(
-                        onPressed: _loading || !ble.isConnected ? null : _saveAll,
-                        icon: const Icon(Icons.save),
+                        onPressed: _loading ? null : _saveAll,
+                        icon: _loading
+                            ? const SizedBox(
+                                width: 18,
+                                height: 18,
+                                child:
+                                    CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.save),
                         label: const Text('Simpan'),
                       ),
                     ),
                   ],
                 ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: _loading ? null : _loginAndPickDevice,
+                  icon: const Icon(Icons.badge_outlined),
+                  label: const Text('Pilih Device BLK (auto-isi)'),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: _loading || !connected ? null : _cleanFingers,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.red.shade700,
+                    side: BorderSide(color: Colors.red.shade300),
+                  ),
+                  icon: const Icon(Icons.delete_sweep_outlined),
+                  label: const Text('Bersihkan fingerprint ESP32'),
+                ),
               ],
             ),
           ),
-          const SizedBox(height: 16),
-          _card(
+          const SizedBox(height: 12),
+
+          // ── WiFi ──
+          _section(
+            icon: Icons.wifi,
             title: 'WiFi Device',
-            subtitle: 'Scan jaringan dari antena ESP32, lalu pilih & kirim password',
+            subtitle: 'Scan dari antena ESP32, pilih jaringan, kirim password',
+            accent: Colors.teal,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 FilledButton.tonalIcon(
-                  onPressed: ble.isConnected && !_wifiScanning ? _scanWifi : null,
+                  onPressed: connected && !_wifiScanning ? _scanWifi : null,
                   icon: _wifiScanning
                       ? const SizedBox(
                           width: 18,
@@ -488,33 +859,47 @@ class _SetelanScreenState extends State<SetelanScreen> {
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
                       : const Icon(Icons.wifi_find),
-                  label: Text(_wifiScanning ? 'Scanning...' : 'Scan WiFi dari ESP32'),
+                  label: Text(
+                      _wifiScanning ? 'Scanning...' : 'Scan WiFi dari ESP32'),
                 ),
                 if (_wifiAps.isNotEmpty) ...[
-                  const SizedBox(height: 8),
-                  ConstrainedBox(
+                  const SizedBox(height: 10),
+                  Container(
                     constraints: const BoxConstraints(maxHeight: 220),
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.grey.shade200),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
                     child: ListView.separated(
                       shrinkWrap: true,
                       itemCount: _wifiAps.length,
-                      separatorBuilder: (context, index) => const Divider(height: 1),
+                      separatorBuilder: (_, _) =>
+                          Divider(height: 1, color: Colors.grey.shade200),
                       itemBuilder: (context, i) {
                         final ap = _wifiAps[i];
                         final selected = ap.ssid == _wifiSsid.text;
                         return ListTile(
                           dense: true,
                           selected: selected,
+                          selectedTileColor:
+                              const Color(0xFF1E88E5).withValues(alpha: 0.08),
                           leading: Icon(
-                            ap.enc ? Icons.lock : Icons.lock_open,
+                            ap.enc ? Icons.lock_outline : Icons.lock_open,
                             size: 20,
-                            color: selected ? const Color(0xFF1E88E5) : null,
+                            color: selected
+                                ? const Color(0xFF1E88E5)
+                                : Colors.grey,
                           ),
                           title: Text(ap.ssid),
-                          subtitle: Text('${_bars(ap.rssi)} (${ap.rssi} dBm)'),
+                          subtitle: Text('${_bars(ap.rssi)} · ${ap.rssi} dBm'),
                           trailing: selected
-                              ? const Icon(Icons.check, color: Color(0xFF1E88E5))
+                              ? const Icon(Icons.check_circle,
+                                  color: Color(0xFF1E88E5), size: 20)
                               : null,
-                          onTap: () => setState(() => _wifiSsid.text = ap.ssid),
+                          onTap: () {
+                            HapticFeedback.selectionClick();
+                            setState(() => _wifiSsid.text = ap.ssid);
+                          },
                         );
                       },
                     ),
@@ -523,65 +908,58 @@ class _SetelanScreenState extends State<SetelanScreen> {
                 const SizedBox(height: 12),
                 TextField(
                   controller: _wifiSsid,
-                  decoration: const InputDecoration(
-                    labelText: 'SSID WiFi',
-                    prefixIcon: Icon(Icons.wifi),
-                    border: OutlineInputBorder(),
-                    isDense: true,
+                  decoration: _fieldDeco(
+                    label: 'SSID',
+                    prefix: const Icon(Icons.wifi),
                   ),
                 ),
                 const SizedBox(height: 12),
                 TextField(
                   controller: _wifiPass,
-                  obscureText: true,
-                  decoration: const InputDecoration(
-                    labelText: 'Password WiFi',
-                    prefixIcon: Icon(Icons.lock_outline),
-                    border: OutlineInputBorder(),
-                    isDense: true,
+                  obscureText: _obscureWifi,
+                  decoration: _fieldDeco(
+                    label: 'Password WiFi',
+                    prefix: const Icon(Icons.lock_outline),
+                    suffix: IconButton(
+                      icon: Icon(_obscureWifi
+                          ? Icons.visibility_off
+                          : Icons.visibility),
+                      onPressed: () =>
+                          setState(() => _obscureWifi = !_obscureWifi),
+                    ),
                   ),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 10),
                 FilledButton.icon(
-                  onPressed: ble.isConnected ? _saveWifi : null,
+                  onPressed: connected ? _saveWifi : null,
                   icon: const Icon(Icons.save_alt),
                   label: const Text('Kirim WiFi ke Device'),
                 ),
               ],
             ),
           ),
-          if (_statusMsg.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 12),
+
+          if (_statusMsg.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFE3F2FD),
+                borderRadius: BorderRadius.circular(12),
+              ),
               child: Text(
                 _statusMsg,
                 textAlign: TextAlign.center,
-                style: const TextStyle(color: Color(0xFF1E88E5), fontSize: 13),
+                style: const TextStyle(
+                  color: Color(0xFF1565C0),
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                ),
               ),
             ),
-        ],
-      ),
-    );
-  }
-
-  Widget _card({
-    required String title,
-    required String subtitle,
-    required Widget child,
-  }) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-            const SizedBox(height: 2),
-            Text(subtitle, style: const TextStyle(color: Colors.grey, fontSize: 12)),
-            const SizedBox(height: 12),
-            child,
           ],
-        ),
+        ],
       ),
     );
   }
