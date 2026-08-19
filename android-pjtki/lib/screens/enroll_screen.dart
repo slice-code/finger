@@ -80,6 +80,10 @@ class _EnrollScreenState extends State<EnrollScreen> {
     });
   }
 
+  Future<void> _cleanupCancelled() async {
+    await context.read<EnrollStore>().removeCancelled(widget.employee.id);
+  }
+
   void _onEvent(BleEvent ev) {
     if (!mounted || _done) return;
     if (_error && ev.type != 'enroll_cancelled') return;
@@ -150,6 +154,7 @@ class _EnrollScreenState extends State<EnrollScreen> {
           _cancelling = false;
           _statusText = 'Enroll dibatalkan';
           _timeout?.cancel();
+          unawaited(_cleanupCancelled());
           Timer(const Duration(milliseconds: 800), () {
             if (mounted) Navigator.of(context).pop(false);
           });
@@ -312,9 +317,10 @@ class _EnrollScreenState extends State<EnrollScreen> {
       return;
     }
     // Fallback jika device tidak balas event (mis. belum mulai enroll).
-    Timer(const Duration(seconds: 3), () {
+    Timer(const Duration(seconds: 3), () async {
       if (mounted && !_done && _cancelling) {
-        Navigator.of(context).pop(false);
+        await _cleanupCancelled();
+        if (mounted) Navigator.of(context).pop(false);
       }
     });
   }

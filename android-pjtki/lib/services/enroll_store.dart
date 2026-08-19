@@ -177,6 +177,15 @@ class EnrollStore {
     await _updateStatus(employeeId, 'failed');
   }
 
+  /// Hapus antrean sync jika enroll dibatalkan sebelum sukses di sensor.
+  Future<void> removeCancelled(String employeeId) async {
+    if (employeeId.isEmpty) return;
+    final rec = findByEmployee(employeeId);
+    if (rec == null) return;
+    if (rec.status == 'enrolled' && rec.fingerId > 0) return;
+    await removeByEmployee(employeeId);
+  }
+
   Future<void> setHex(String employeeId, int fingerId, String hex) async {
     if (employeeId.isEmpty || hex.length != 512) return;
     final now = DateTime.now().toIso8601String();
