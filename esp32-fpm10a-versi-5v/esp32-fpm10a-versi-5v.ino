@@ -2821,9 +2821,24 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
   }
 
   lcdShowEnrollTitle(id);
-  lcdEnrollStep("Angkat jari", -1, "Sensor harus kosong", COL_TEXT);
   emit(F("{\"event\":\"enroll_start\",\"id\":%d}"), id);
   enrollKeepAliveUi();
+
+  // FPM10A wajib konfirmasi NOFINGER dulu — klon over-sensitive bisa false OK.
+  // Tampilkan "angkat jari" hanya jika sensor/T-OUT masih mendeteksi sentuhan.
+  flushRX();
+  disableLoopWDT();
+  uint8_t pre = finger.getImage();
+  enableLoopWDT();
+  esp_task_wdt_reset();
+  bool fingerStillThere = (pre == FINGERPRINT_OK) ||
+      (appSettings.irEnabled && irCalibrated && irRawDetected());
+  if (fingerStillThere) {
+    lcdEnrollStep("Angkat jari", -1, "Lepas dari kaca dulu", COL_WARN);
+  } else {
+    lcdEnrollStep("Siap enroll", -1, "Tempel jari sebentar lagi", COL_OK);
+  }
+
   if (!waitNoFinger()) {
     if (enrollAbortIfCancelled("wait_clear")) return 0xFD;
     logError("enroll timeout waiting for no finger");
