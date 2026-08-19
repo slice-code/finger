@@ -4,8 +4,10 @@ import 'package:provider/provider.dart';
 
 import '../models/models.dart';
 import '../services/api_service.dart';
+import '../services/ble_service.dart';
 import '../services/settings_store.dart';
 import '../theme/app_theme.dart';
+import 'enroll_screen.dart';
 
 /// Manajemen akun karyawan app (enroll + absensi) — staff BLK via JWT.
 class AppKaryawanScreen extends StatefulWidget {
@@ -116,13 +118,18 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
   Future<void> loadFromParent() => _load();
 
   List<AppKaryawan> get _filtered {
-    if (_q.isEmpty) return _rows;
+    Iterable<AppKaryawan> list = _rows;
+    if (_statusFilter == 'no_finger') {
+      list = list.where((k) => k.needsFingerEnroll);
+    }
+    if (_q.isEmpty) return list.toList();
     final q = _q.toLowerCase();
-    return _rows.where((k) {
+    return list.where((k) {
       return k.nama.toLowerCase().contains(q) ||
           k.email.toLowerCase().contains(q) ||
           (k.kodeKaryawan ?? '').toLowerCase().contains(q) ||
-          (k.jabatan ?? '').toLowerCase().contains(q);
+          (k.jabatan ?? '').toLowerCase().contains(q) ||
+          (k.fingerEmployeeId ?? '').toLowerCase().contains(q);
     }).toList();
   }
 
@@ -153,9 +160,12 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
       try {
         branches = await api.fetchBranches();
       } catch (_) {}
+      final apiStatus = _statusFilter == 'no_finger'
+          ? null
+          : (_statusFilter.isEmpty ? null : _statusFilter);
       final result = await api.fetchAppKaryawanList(
         perPage: 200,
-        status: _statusFilter.isEmpty ? null : _statusFilter,
+        status: apiStatus,
       );
       if (!mounted) return;
       setState(() {
@@ -169,6 +179,34 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
     } finally {
       if (mounted) setState(() => _loading = false);
     }
+  }
+
+  Future<void> _enrollFinger(AppKaryawan k) async {
+    final ble = context.read<BleService>();
+    if (!ble.isConnected) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Hubungkan ESP32 via BLE dulu (tab Setelan / Beranda)'),
+        ),
+      );
+      return;
+    }
+    final empId = k.fingerEmployeeId?.trim() ?? '';
+    if (empId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('ID sidik jari karyawan belum tersedia — refresh daftar')),
+      );
+      return;
+    }
+    final ok = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => EnrollScreen(
+          employee: Employee(id: empId, nama: k.nama, fingerTerdaftar: false),
+          uploadStaffToServer: true,
+        ),
+      ),
+    );
+    if (ok == true) await _load();
   }
 
   Future<void> _openEnroll({AppKaryawan? edit}) async {
@@ -278,6 +316,15 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
                           _load();
                         },
                       ),
+                      const SizedBox(width: 6),
+                      FilterChip(
+                        label: const Text('Belum finger'),
+                        selected: _statusFilter == 'no_finger',
+                        onSelected: (_) {
+                          setState(() => _statusFilter = 'no_finger');
+                          _load();
+                        },
+                      ),
                     ],
                   ),
                 ],
@@ -333,10 +380,25 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
                           if (k.kodeCabang != null && k.kodeCabang!.isNotEmpty)
                             Text('Cabang: ${k.kodeCabang}',
                                 style: const TextStyle(fontSize: 12)),
+                          if (k.hasFinger && k.fingerId != null && k.fingerId! > 0)
+                            Text('Finger slot ${k.fingerId}',
+                                style: TextStyle(
+                                    fontSize: 12,
+                                    color: AppTheme.success)),
                         ],
                       ),
                       isThreeLine: true,
-                      trailing: PopupMenuButton<String>(
+                      trailing: k.needsFingerEnroll
+                          ? FilledButton.tonal(
+                              onPressed: () => _enrollFinger(k),
+                              child: const Text('Enroll'),
+                            )
+                          : k.hasFinger
+                              ? const Chip(
+                                  label: Text('Finger OK'),
+                                  visualDensity: VisualDensity.compact,
+                                )
+                              : PopupMenuButton<String>(
                         onSelected: (v) {
                           if (v == 'edit' && !k.isSyncedUser) _openEnroll(edit: k);
                           if (v == 'toggle') _toggleStatus(k);
@@ -351,7 +413,11 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
                         ],
                       ),
                       onTap: () {
-                        if (!k.isSyncedUser) _openEnroll(edit: k);
+                        if (k.needsFingerEnroll) {
+                          _enrollFinger(k);
+                        } else if (!k.isSyncedUser) {
+                          _openEnroll(edit: k);
+                        }
                       },
                     ),
                   );

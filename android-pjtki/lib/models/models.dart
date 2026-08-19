@@ -195,6 +195,9 @@ class AppKaryawan {
   final int? userId;
   final bool hasAppAccess;
   final String? sumber;
+  final String? fingerEmployeeId;
+  final int? fingerId;
+  final bool hasFinger;
 
   AppKaryawan({
     required this.id,
@@ -209,11 +212,15 @@ class AppKaryawan {
     this.userId,
     this.hasAppAccess = true,
     this.sumber,
+    this.fingerEmployeeId,
+    this.fingerId,
+    this.hasFinger = false,
   });
 
   bool get isActive => status == 'active';
   bool get isSyncedUser => userId != null && userId! > 0;
   bool get isSatpam => !hasAppAccess;
+  bool get needsFingerEnroll => isActive && !hasFinger;
 
   factory AppKaryawan.fromJson(Map<String, dynamic> json) {
     final access = json['has_app_access']?.toString().toLowerCase();
@@ -230,6 +237,9 @@ class AppKaryawan {
       userId: (json['user_id'] as num?)?.toInt(),
       hasAppAccess: access == null || access == 'yes' || access == 'true' || access == '1',
       sumber: json['sumber']?.toString(),
+      fingerEmployeeId: json['finger_employee_id']?.toString(),
+      fingerId: (json['finger_id'] as num?)?.toInt(),
+      hasFinger: json['has_finger'] == true,
     );
   }
 }

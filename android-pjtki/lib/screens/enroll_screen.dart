@@ -3,13 +3,21 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../models/models.dart';
+import '../services/api_service.dart';
 import '../services/ble_service.dart';
 import '../services/enroll_store.dart';
 import '../theme/app_theme.dart';
 
 class EnrollScreen extends StatefulWidget {
   final Employee employee;
-  const EnrollScreen({super.key, required this.employee});
+  /// Set true untuk karyawan staff (KRY-*) — upload template ke server setelah enroll.
+  final bool uploadStaffToServer;
+
+  const EnrollScreen({
+    super.key,
+    required this.employee,
+    this.uploadStaffToServer = false,
+  });
 
   @override
   State<EnrollScreen> createState() => _EnrollScreenState();
@@ -202,12 +210,37 @@ class _EnrollScreenState extends State<EnrollScreen> {
       hex: hex.length == 512 ? hex : null,
     );
     if (!mounted) return;
-    setState(() {
-      _progress = 100;
-      _statusText = hex.length == 512
-          ? 'Berhasil (ID $fingerId) — hex tersimpan di HP'
-          : 'Terdaftar (ID $fingerId) — hex belum lengkap di HP';
-    });
+    if (widget.uploadStaffToServer && hex.length == 512 && fingerId > 0) {
+      setState(() {
+        _progress = 98;
+        _statusText = 'Mengupload template ke server...';
+      });
+      try {
+        await context.read<ApiService>().uploadEnroll(
+              employeeId: widget.employee.id,
+              fingerId: fingerId,
+              templateHex: hex,
+            );
+        setState(() {
+          _progress = 100;
+          _statusText = 'Berhasil (ID $fingerId) — tersimpan di HP & server';
+        });
+      } catch (e) {
+        debugPrint('[ENROLL] staff upload failed: $e');
+        setState(() {
+          _progress = 100;
+          _statusText =
+              'Terdaftar di sensor (ID $fingerId) — upload server gagal, sync nanti';
+        });
+      }
+    } else {
+      setState(() {
+        _progress = 100;
+        _statusText = hex.length == 512
+            ? 'Berhasil (ID $fingerId) — hex tersimpan di HP'
+            : 'Terdaftar (ID $fingerId) — hex belum lengkap di HP';
+      });
+    }
     debugPrint('[ENROLL] local saved id=$fingerId hex=${hex.length}');
   }
 
