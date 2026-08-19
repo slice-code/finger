@@ -91,7 +91,7 @@ class AppKaryawanScreenState extends State<AppKaryawanScreen>
           ? FloatingActionButton.extended(
               onPressed: () => _daftarKey.currentState?._openEnroll(),
               icon: const Icon(Icons.person_add),
-              label: const Text('Enroll'),
+              label: const Text('Tambah karyawan'),
             )
           : FloatingActionButton.extended(
               onPressed: () => _absensiKey.currentState?._addManual(),

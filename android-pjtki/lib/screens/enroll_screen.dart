@@ -96,7 +96,7 @@ class _EnrollScreenState extends State<EnrollScreen> {
         case 'enroll_start':
           _step = 0;
           _progress = 5;
-          _statusText = 'Mode enroll aktif — LCD & lampu sensor menyala';
+          _statusText = 'Pastikan jari tidak menyentuh sensor';
           break;
         case 'waiting_finger':
           _step = 1;
@@ -111,7 +111,7 @@ class _EnrollScreenState extends State<EnrollScreen> {
         case 'remove':
           _step = 2;
           _progress = 50;
-          _statusText = _steps[2];
+          _statusText = 'Scan ke-1 berhasil — angkat jari dari sensor';
           break;
         case 'waiting_finger_2':
           _step = 3;

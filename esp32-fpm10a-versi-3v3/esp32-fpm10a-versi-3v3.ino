@@ -2819,7 +2819,7 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
   }
 
   lcdShowEnrollTitle(id);
-  lcdEnrollStep("Remove finger", -1, "Clear sensor first", COL_TEXT);
+  lcdEnrollStep("Angkat jari", -1, "Sensor harus kosong", COL_TEXT);
   emit(F("{\"event\":\"enroll_start\",\"id\":%d}"), id);
   enrollKeepAliveUi();
   if (!waitNoFinger()) {
@@ -2887,7 +2887,7 @@ uint8_t enrollFinger(uint8_t id, const char *name, const char *empId) {
       return 0xFF;
     }
 
-    lcdEnrollStep("Remove finger", 50, "Lift finger off sensor", COL_TEXT);
+    lcdEnrollStep("Angkat jari", 50, "Angkat dari kaca sensor", COL_TEXT);
     emit(F("{\"event\":\"remove\"}"));
     enrollKeepAliveUi();
     if (!waitNoFinger()) {
