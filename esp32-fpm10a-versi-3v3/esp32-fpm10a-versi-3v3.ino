@@ -2688,9 +2688,6 @@ void wifiOpsEnd(bool resumeAuto) {
 void wifiInit() {
   wifiLoadCreds();
 
-  // Boot: mulai hemat CPU (240MHz default = panas + drain).
-  // 80MHz cukup untuk polling sensor 20Hz + web UI + HTTP; UART2 hardware
-  // tidak terpengaruh clock CPU.
   setCpuFrequencyMhz(80);
   WiFi.setSleep(false);
 
@@ -5056,6 +5053,9 @@ void setup() {
   Serial.printf("[BOOT] Reset reason: %s\n", resetReasonStr(esp_reset_reason()));
   Serial.print("Free heap: "); Serial.println(ESP.getFreeHeap());
 
+  // setup() >5s (WiFi + sensor + BLE) — loopTask WDT off sampai setup selesai.
+  disableLoopWDT();
+
   // LCD
   tft.init();
   tft.setRotation(1);
@@ -5092,7 +5092,9 @@ void setup() {
   // NTP - start after WiFi
   timeClient.begin();
   timeClient.setUpdateInterval(60000);
-  timeClient.update();
+  if (WiFi.status() == WL_CONNECTED) {
+    timeClient.update();
+  }
 
   // Web server & softAP DIHAPUS (2026-08-13) — kontrol & setup via BLE saja.
   // Upload data tetap via WiFi STA (attnWorker/syncWorker/cacheWorker → HTTPClient).
@@ -5239,6 +5241,8 @@ void setup() {
   // atau lewat tombol Refresh (hindari blok boot dengan unduhan 49KB).
   lastCacheSyncMs = millis();
   cacheEnsureDir();
+
+  enableLoopWDT();
 }
 
 // ────────────────────────────────────────────────────────────────────
