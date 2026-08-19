@@ -321,8 +321,9 @@ class ApiService {
 
   Future<AppKaryawan> createAppKaryawan({
     required String nama,
-    required String email,
-    required String password,
+    String? email,
+    String? password,
+    bool hasAppAccess = true,
     String? kodeKaryawan,
     String? phone,
     String? kodeCabang,
@@ -333,9 +334,10 @@ class ApiService {
       _url('/api/finger/app-karyawan'),
       data: {
         'nama': nama,
-        'email': email,
-        'password': password,
+        'has_app_access': hasAppAccess ? 'yes' : 'no',
         'status': 'active',
+        if (email != null && email.isNotEmpty) 'email': email,
+        if (password != null && password.isNotEmpty) 'password': password,
         if (kodeKaryawan != null && kodeKaryawan.isNotEmpty)
           'kode_karyawan': kodeKaryawan,
         if (phone != null && phone.isNotEmpty) 'phone': phone,

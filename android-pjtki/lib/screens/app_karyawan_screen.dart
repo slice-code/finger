@@ -281,7 +281,8 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
               child: AppEmptyState(
                 icon: Icons.people_outline,
                 title: 'Belum ada karyawan',
-                subtitle: 'Daftarkan akun agar bisa login ke app.',
+                subtitle:
+                    'User sistem (bio, blk, …) muncul otomatis setelah sync. Tambah manual untuk satpam tanpa akses app.',
               ),
             )
           else
@@ -301,13 +302,25 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
                       subtitle: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(k.email),
+                          if (k.hasAppAccess && k.email.isNotEmpty)
+                            Text(k.email)
+                          else if (k.isSatpam)
+                            Text('Tanpa akses app',
+                                style: TextStyle(
+                                    color: Theme.of(context)
+                                        .colorScheme
+                                        .onSurfaceVariant)),
                           if (k.jabatan != null && k.jabatan!.isNotEmpty)
                             Text(k.jabatan!,
                                 style: TextStyle(
                                     color: Theme.of(context)
                                         .colorScheme
                                         .onSurfaceVariant)),
+                          if (k.isSyncedUser)
+                            Text('User sistem',
+                                style: TextStyle(
+                                    fontSize: 12,
+                                    color: Theme.of(context).colorScheme.primary)),
                           if (k.kodeCabang != null && k.kodeCabang!.isNotEmpty)
                             Text('Cabang: ${k.kodeCabang}',
                                 style: const TextStyle(fontSize: 12)),
@@ -316,18 +329,21 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
                       isThreeLine: true,
                       trailing: PopupMenuButton<String>(
                         onSelected: (v) {
-                          if (v == 'edit') _openEnroll(edit: k);
+                          if (v == 'edit' && !k.isSyncedUser) _openEnroll(edit: k);
                           if (v == 'toggle') _toggleStatus(k);
                         },
                         itemBuilder: (_) => [
-                          const PopupMenuItem(value: 'edit', child: Text('Edit')),
+                          if (!k.isSyncedUser)
+                            const PopupMenuItem(value: 'edit', child: Text('Edit')),
                           PopupMenuItem(
                             value: 'toggle',
                             child: Text(k.isActive ? 'Nonaktifkan' : 'Aktifkan'),
                           ),
                         ],
                       ),
-                      onTap: () => _openEnroll(edit: k),
+                      onTap: () {
+                        if (!k.isSyncedUser) _openEnroll(edit: k);
+                      },
                     ),
                   );
                 },
@@ -363,6 +379,7 @@ class _EnrollKaryawanSheetState extends State<_EnrollKaryawanSheet> {
   String? _cabang;
   bool _obscure = true;
   bool _saving = false;
+  bool _hasAppAccess = true;
   String? _error;
 
   bool get _isEdit => widget.edit != null;
@@ -379,6 +396,7 @@ class _EnrollKaryawanSheetState extends State<_EnrollKaryawanSheet> {
       _jabatan.text = e.jabatan ?? '';
       _departemen.text = e.departemen ?? '';
       _cabang = e.kodeCabang;
+      _hasAppAccess = e.hasAppAccess;
       if (e.kodeCabang != null) _cabangManual.text = e.kodeCabang!;
     } else {
       final settings = context.read<SettingsStore>();
@@ -406,13 +424,19 @@ class _EnrollKaryawanSheetState extends State<_EnrollKaryawanSheet> {
     final nama = _nama.text.trim();
     final email = _email.text.trim();
     final pass = _password.text;
-    if (nama.isEmpty || email.isEmpty) {
-      setState(() => _error = 'Nama dan email wajib');
+    if (nama.isEmpty) {
+      setState(() => _error = 'Nama wajib');
       return;
     }
-    if (!_isEdit && pass.isEmpty) {
-      setState(() => _error = 'Password wajib untuk akun baru');
-      return;
+    if (_hasAppAccess) {
+      if (email.isEmpty) {
+        setState(() => _error = 'Email wajib jika punya akses app');
+        return;
+      }
+      if (!_isEdit && pass.isEmpty) {
+        setState(() => _error = 'Password wajib untuk akun baru');
+        return;
+      }
     }
     setState(() {
       _saving = true;
@@ -435,8 +459,9 @@ class _EnrollKaryawanSheetState extends State<_EnrollKaryawanSheet> {
       } else {
         await api.createAppKaryawan(
           nama: nama,
-          email: email,
-          password: pass,
+          email: email.isEmpty ? null : email,
+          password: pass.isEmpty ? null : pass,
+          hasAppAccess: _hasAppAccess,
           phone: _phone.text.trim(),
           kodeCabang: _cabang,
           jabatan: _jabatan.text.trim(),
@@ -472,9 +497,21 @@ class _EnrollKaryawanSheetState extends State<_EnrollKaryawanSheet> {
             Text(
               _isEdit
                   ? 'Kosongkan password jika tidak ingin mengubah.'
-                  : 'Akun ini bisa login ke app mobile.',
+                  : _hasAppAccess
+                      ? 'Karyawan dengan akses app bisa login mobile.'
+                      : 'Contoh satpam — hanya untuk absensi manual, tanpa login app.',
               style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
             ),
+            if (!_isEdit) ...[
+              const SizedBox(height: 12),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Punya akses app'),
+                subtitle: const Text('Nonaktifkan untuk satpam / tanpa login'),
+                value: _hasAppAccess,
+                onChanged: (v) => setState(() => _hasAppAccess = v),
+              ),
+            ],
             const SizedBox(height: 16),
             TextField(
               controller: _nama,
@@ -482,25 +519,27 @@ class _EnrollKaryawanSheetState extends State<_EnrollKaryawanSheet> {
               decoration: const InputDecoration(labelText: 'Nama *'),
             ),
             const SizedBox(height: 12),
-            TextField(
-              controller: _email,
-              keyboardType: TextInputType.emailAddress,
-              textInputAction: TextInputAction.next,
-              decoration: const InputDecoration(labelText: 'Email login *'),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _password,
-              obscureText: _obscure,
-              decoration: InputDecoration(
-                labelText: _isEdit ? 'Password baru' : 'Password *',
-                suffixIcon: IconButton(
-                  icon: Icon(_obscure ? Icons.visibility_outlined : Icons.visibility_off_outlined),
-                  onPressed: () => setState(() => _obscure = !_obscure),
+            if (_hasAppAccess) ...[
+              TextField(
+                controller: _email,
+                keyboardType: TextInputType.emailAddress,
+                textInputAction: TextInputAction.next,
+                decoration: const InputDecoration(labelText: 'Email login *'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _password,
+                obscureText: _obscure,
+                decoration: InputDecoration(
+                  labelText: _isEdit ? 'Password baru' : 'Password *',
+                  suffixIcon: IconButton(
+                    icon: Icon(_obscure ? Icons.visibility_outlined : Icons.visibility_off_outlined),
+                    onPressed: () => setState(() => _obscure = !_obscure),
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(height: 12),
+              const SizedBox(height: 12),
+            ],
             TextField(
               controller: _phone,
               keyboardType: TextInputType.phone,

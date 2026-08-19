@@ -192,6 +192,9 @@ class AppKaryawan {
   final String? jabatan;
   final String? departemen;
   final String status;
+  final int? userId;
+  final bool hasAppAccess;
+  final String? sumber;
 
   AppKaryawan({
     required this.id,
@@ -203,11 +206,17 @@ class AppKaryawan {
     this.jabatan,
     this.departemen,
     this.status = 'active',
+    this.userId,
+    this.hasAppAccess = true,
+    this.sumber,
   });
 
   bool get isActive => status == 'active';
+  bool get isSyncedUser => userId != null && userId! > 0;
+  bool get isSatpam => !hasAppAccess;
 
   factory AppKaryawan.fromJson(Map<String, dynamic> json) {
+    final access = json['has_app_access']?.toString().toLowerCase();
     return AppKaryawan(
       id: (json['id'] as num?)?.toInt() ?? 0,
       kodeKaryawan: json['kode_karyawan']?.toString(),
@@ -218,6 +227,9 @@ class AppKaryawan {
       jabatan: json['jabatan']?.toString(),
       departemen: json['departemen']?.toString(),
       status: json['status']?.toString() ?? 'active',
+      userId: (json['user_id'] as num?)?.toInt(),
+      hasAppAccess: access == null || access == 'yes' || access == 'true' || access == '1',
+      sumber: json['sumber']?.toString(),
     );
   }
 }
