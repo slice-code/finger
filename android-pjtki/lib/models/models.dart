@@ -239,7 +239,9 @@ class AppKaryawan {
       sumber: json['sumber']?.toString(),
       fingerEmployeeId: json['finger_employee_id']?.toString(),
       fingerId: (json['finger_id'] as num?)?.toInt(),
-      hasFinger: json['has_finger'] == true,
+      hasFinger: json['has_finger'] == true ||
+          json['has_finger'] == 1 ||
+          json['has_finger']?.toString().toLowerCase() == 'true',
     );
   }
 }

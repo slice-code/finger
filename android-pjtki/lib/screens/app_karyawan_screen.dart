@@ -37,7 +37,14 @@ class AppKaryawanScreenState extends State<AppKaryawanScreen>
 
   /// Dipanggil saat tab Staff dipilih di bottom nav (data server bisa baru di-update).
   Future<void> reload() async {
-    await _daftarKey.currentState?.loadFromParent();
+    final daftar = _daftarKey.currentState;
+    if (daftar != null) {
+      await daftar.loadFromParent();
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _daftarKey.currentState?.loadFromParent();
+    });
   }
 
   @override
@@ -113,6 +120,9 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _load();
+    });
   }
 
   Future<void> loadFromParent() => _load();
@@ -133,12 +143,12 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
     }).toList();
   }
 
-  Future<void> _load() async {
+  Future<void> _load({bool allowTokenRefresh = true}) async {
     final settings = context.read<SettingsStore>();
     if (settings.authToken.isEmpty) {
       setState(() {
         _loading = false;
-        _error = 'Belum login BLK — logout lalu masuk ulang.';
+        _error = 'Belum login BLK — logout lalu masuk ulang di Setelan.';
       });
       return;
     }
@@ -174,11 +184,40 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
       });
     } catch (e) {
       if (mounted) {
-        setState(() => _error = e.toString().replaceAll('Exception: ', ''));
+        final msg = e.toString().replaceAll('Exception: ', '');
+        if (allowTokenRefresh &&
+            settings.authToken.isNotEmpty &&
+            (msg.contains('Token') ||
+                msg.contains('401') ||
+                msg.contains('Unauthorized'))) {
+          try {
+            await context.read<ApiService>().refreshAuthToken();
+            await _load(allowTokenRefresh: false);
+            return;
+          } catch (_) {}
+        }
+        setState(() => _error = msg);
       }
     } finally {
       if (mounted) setState(() => _loading = false);
     }
+  }
+
+  String? get _emptyMessage {
+    if (_rows.isEmpty) return null;
+    if (_statusFilter == 'no_finger') {
+      return 'Semua karyawan aktif sudah punya sidik jari, atau tidak ada yang aktif.';
+    }
+    if (_statusFilter == 'inactive') {
+      return 'Tidak ada karyawan nonaktif. Ketuk "Tampilkan semua" di bawah.';
+    }
+    if (_statusFilter == 'active' && _q.isEmpty) {
+      return 'Tidak ada karyawan aktif.';
+    }
+    if (_q.isNotEmpty) {
+      return 'Tidak ada hasil untuk pencarian "$_q".';
+    }
+    return 'Tidak ada data yang cocok dengan filter.';
   }
 
   Future<void> _enrollFinger(AppKaryawan k) async {
@@ -288,57 +327,85 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
                     onChanged: (v) => setState(() => _q = v.trim()),
                   ),
                   const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      FilterChip(
-                        label: const Text('Semua'),
-                        selected: _statusFilter.isEmpty,
-                        onSelected: (_) {
-                          setState(() => _statusFilter = '');
-                          _load();
-                        },
-                      ),
-                      const SizedBox(width: 6),
-                      FilterChip(
-                        label: const Text('Aktif'),
-                        selected: _statusFilter == 'active',
-                        onSelected: (_) {
-                          setState(() => _statusFilter = 'active');
-                          _load();
-                        },
-                      ),
-                      const SizedBox(width: 6),
-                      FilterChip(
-                        label: const Text('Nonaktif'),
-                        selected: _statusFilter == 'inactive',
-                        onSelected: (_) {
-                          setState(() => _statusFilter = 'inactive');
-                          _load();
-                        },
-                      ),
-                      const SizedBox(width: 6),
-                      FilterChip(
-                        label: const Text('Belum finger'),
-                        selected: _statusFilter == 'no_finger',
-                        onSelected: (_) {
-                          setState(() => _statusFilter = 'no_finger');
-                          _load();
-                        },
-                      ),
-                    ],
+                  SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      children: [
+                        FilterChip(
+                          label: const Text('Semua'),
+                          selected: _statusFilter.isEmpty,
+                          onSelected: (_) {
+                            setState(() => _statusFilter = '');
+                            _load();
+                          },
+                        ),
+                        const SizedBox(width: 6),
+                        FilterChip(
+                          label: const Text('Aktif'),
+                          selected: _statusFilter == 'active',
+                          onSelected: (_) {
+                            setState(() => _statusFilter = 'active');
+                            _load();
+                          },
+                        ),
+                        const SizedBox(width: 6),
+                        FilterChip(
+                          label: const Text('Nonaktif'),
+                          selected: _statusFilter == 'inactive',
+                          onSelected: (_) {
+                            setState(() => _statusFilter = 'inactive');
+                            _load();
+                          },
+                        ),
+                        const SizedBox(width: 6),
+                        FilterChip(
+                          label: const Text('Belum finger'),
+                          selected: _statusFilter == 'no_finger',
+                          onSelected: (_) {
+                            setState(() => _statusFilter = 'no_finger');
+                            _load();
+                          },
+                        ),
+                      ],
+                    ),
                   ),
+                  if (_rows.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          '${_rows.length} karyawan${_statusFilter.isNotEmpty ? ' · filter aktif' : ''}',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Theme.of(context).colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                    ),
                 ],
               ),
             ),
           ),
           if (filtered.isEmpty)
-            const SliverFillRemaining(
+            SliverFillRemaining(
               hasScrollBody: false,
               child: AppEmptyState(
                 icon: Icons.people_outline,
-                title: 'Belum ada karyawan',
-                subtitle:
-                    'User sistem (bio, blk, …) muncul otomatis setelah sync. Tambah manual untuk satpam tanpa akses app.',
+                title: _rows.isEmpty ? 'Belum ada karyawan' : 'Tidak ada yang ditampilkan',
+                subtitle: _rows.isEmpty
+                    ? 'User sistem (bio, blk, …) muncul otomatis setelah sync. Tambah manual untuk satpam tanpa akses app.'
+                    : (_emptyMessage ??
+                        'Coba reset filter atau tarik ke bawah untuk refresh.'),
+                actionLabel: _rows.isEmpty
+                    ? 'Refresh'
+                    : (_statusFilter.isNotEmpty ? 'Tampilkan semua' : 'Refresh'),
+                onAction: () {
+                  if (_rows.isNotEmpty && _statusFilter.isNotEmpty) {
+                    setState(() => _statusFilter = '');
+                  }
+                  _load();
+                },
               ),
             )
           else
@@ -385,20 +452,31 @@ class _DaftarKaryawanTabState extends State<_DaftarKaryawanTab> {
                                 style: TextStyle(
                                     fontSize: 12,
                                     color: AppTheme.success)),
+                          if (k.needsFingerEnroll)
+                            Padding(
+                              padding: const EdgeInsets.only(top: 8),
+                              child: Align(
+                                alignment: Alignment.centerLeft,
+                                child: FilledButton.tonal(
+                                  onPressed: () => _enrollFinger(k),
+                                  style: FilledButton.styleFrom(
+                                    visualDensity: VisualDensity.compact,
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 12, vertical: 6),
+                                  ),
+                                  child: const Text('Enroll finger'),
+                                ),
+                              ),
+                            ),
                         ],
                       ),
                       isThreeLine: true,
-                      trailing: k.needsFingerEnroll
-                          ? FilledButton.tonal(
-                              onPressed: () => _enrollFinger(k),
-                              child: const Text('Enroll'),
+                      trailing: k.hasFinger
+                          ? const Chip(
+                              label: Text('Finger OK'),
+                              visualDensity: VisualDensity.compact,
                             )
-                          : k.hasFinger
-                              ? const Chip(
-                                  label: Text('Finger OK'),
-                                  visualDensity: VisualDensity.compact,
-                                )
-                              : PopupMenuButton<String>(
+                          : PopupMenuButton<String>(
                         onSelected: (v) {
                           if (v == 'edit' && !k.isSyncedUser) _openEnroll(edit: k);
                           if (v == 'toggle') _toggleStatus(k);
